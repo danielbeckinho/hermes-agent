@@ -547,6 +547,34 @@ class TestVoiceChannelCommands:
         event.raw_message = SimpleNamespace(guild_id=guild_id, guild=None)
         return event
 
+    # -- /voice mode interaction with a joined channel --
+
+    @pytest.mark.asyncio
+    async def test_voice_on_preserves_all_replies_for_linked_live_channel(self, runner):
+        """`/voice on` must not undo the all-replies mode established by join."""
+        mock_adapter = MagicMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter.is_in_voice_channel.return_value = True
+        event = self._make_discord_event("/voice on")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        await runner._handle_voice_command(event)
+
+        assert runner._voice_mode["discord:123"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_voice_on_remains_voice_only_when_other_channel_is_bound(self, runner):
+        """A live VC bound to another text channel must not widen this channel."""
+        mock_adapter = MagicMock()
+        mock_adapter._voice_text_channels = {111: 456}
+        mock_adapter.is_in_voice_channel.return_value = True
+        event = self._make_discord_event("/voice on")
+        runner.adapters[event.source.platform] = mock_adapter
+
+        await runner._handle_voice_command(event)
+
+        assert runner._voice_mode["discord:123"] == "voice_only"
+
     # -- _handle_voice_channel_join --
 
 
