@@ -507,6 +507,23 @@ def _search_members(token: str, guild_id: str, query: str, limit: int = 20, **_k
     return json.dumps({"members": result, "count": len(result)})
 
 
+def _list_active_threads(token: str, guild_id: str, **_kwargs: Any) -> str:
+    """List active threads the bot can access in a guild."""
+    data = _discord_request("GET", f"/guilds/{guild_id}/threads/active", token)
+    threads = []
+    for thread in data.get("threads", []):
+        metadata = thread.get("thread_metadata", {})
+        threads.append({
+            "id": thread["id"],
+            "name": thread.get("name"),
+            "parent_id": thread.get("parent_id"),
+            "type": _channel_type_name(thread.get("type", 0)),
+            "archived": metadata.get("archived", False),
+            "locked": metadata.get("locked", False),
+        })
+    return json.dumps({"threads": threads, "count": len(threads)})
+
+
 def _fetch_messages(
     token: str, channel_id: str, limit: int = 50,
     before: Optional[str] = None, after: Optional[str] = None,
@@ -637,6 +654,7 @@ _ACTIONS = {
     "list_roles": _list_roles,
     "member_info": _member_info,
     "search_members": _search_members,
+    "list_active_threads": _list_active_threads,
     "fetch_messages": _fetch_messages,
     "list_pins": _list_pins,
     "pin_message": _pin_message,
@@ -647,7 +665,7 @@ _ACTIONS = {
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "list_active_threads", "search_members", "create_thread"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -664,6 +682,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("list_roles", "(guild_id)", "roles sorted by position"),
     ("member_info", "(guild_id, user_id)", "lookup a specific member"),
     ("search_members", "(guild_id, query)", "find members by name prefix"),
+    ("list_active_threads", "(guild_id)", "active threads the bot can access"),
     ("fetch_messages", "(channel_id)", "recent messages; optional before/after snowflakes"),
     ("list_pins", "(channel_id)", "pinned messages in a channel"),
     ("pin_message", "(channel_id, message_id)", "pin a message"),
@@ -684,6 +703,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "list_roles": ["guild_id"],
     "member_info": ["guild_id", "user_id"],
     "search_members": ["guild_id", "query"],
+    "list_active_threads": ["guild_id"],
     "channel_info": ["channel_id"],
     "fetch_messages": ["channel_id"],
     "list_pins": ["channel_id"],
@@ -944,6 +964,9 @@ _ACTION_403_HINT = {
     "fetch_messages": (
         "Bot cannot view this channel (missing VIEW_CHANNEL or READ_MESSAGE_HISTORY)."
     ),
+    "list_active_threads": (
+        "Bot cannot view threads in this server (missing VIEW_CHANNEL or READ_MESSAGE_HISTORY)."
+    ),
     "list_pins": (
         "Bot cannot view this channel (missing VIEW_CHANNEL or READ_MESSAGE_HISTORY)."
     ),
@@ -1063,7 +1086,7 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord action."""
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 
