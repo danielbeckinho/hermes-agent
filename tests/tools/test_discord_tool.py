@@ -251,6 +251,33 @@ class TestSearchMembers:
 
 
 # ---------------------------------------------------------------------------
+# Action: list_active_threads
+# ---------------------------------------------------------------------------
+
+class TestListActiveThreads:
+    @patch("tools.discord_tool._discord_request")
+    def test_lists_active_threads(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "threads": [{
+                "id": "1001", "name": "Research", "parent_id": "11", "type": 11,
+                "thread_metadata": {"archived": False, "locked": False},
+            }],
+        }
+
+        result = json.loads(discord_core(action="list_active_threads", guild_id="111"))
+
+        assert result == {
+            "threads": [{
+                "id": "1001", "name": "Research", "parent_id": "11", "type": "public_thread",
+                "archived": False, "locked": False,
+            }],
+            "count": 1,
+        }
+        mock_req.assert_called_once_with("GET", "/guilds/111/threads/active", "test-token")
+
+
+# ---------------------------------------------------------------------------
 # Action: fetch_messages
 # ---------------------------------------------------------------------------
 
