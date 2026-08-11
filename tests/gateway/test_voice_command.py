@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import queue
 import sys
@@ -1402,6 +1403,183 @@ class TestPlaybackTimeout:
             mock_vc.stop.assert_called()
         finally:
             DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
+
+
+# =====================================================================
+# Playback lifecycle diagnostic logging
+# =====================================================================
+
+def _lifecycle_records(caplog):
+    """Parse ``discord_voice_playback <json>`` lines out of caplog."""
+    out = []
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        if msg.startswith("discord_voice_playback "):
+            out.append(json.loads(msg[len("discord_voice_playback "):]))
+    return out
+
+
+class TestPlaybackLifecycleLogging:
+    """Every play_in_voice_channel attempt must emit one sanitized,
+    structured lifecycle log recording route facts and final outcome."""
+
+    @staticmethod
+    def _make_discord_adapter():
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig, Platform
+        config = PlatformConfig(enabled=True, extra={})
+        config.token = "fake-token"
+        adapter = object.__new__(DiscordAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter.config = config
+        adapter._voice_clients = {}
+        adapter._voice_locks = {}
+        adapter._voice_text_channels = {}
+        adapter._voice_sources = {}
+        adapter._voice_timeout_tasks = {}
+        adapter._voice_receivers = {}
+        adapter._voice_listen_tasks = {}
+        adapter._voice_input_callback = None
+        adapter._on_voice_disconnect = None
+        adapter._client = None
+        adapter._broadcast = AsyncMock()
+        adapter._allowed_user_ids = set()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_callback_runtime_error_logs_callback_error_outcome(self, caplog):
+        adapter = self._make_discord_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+
+        def _play(_source, after):
+            after(RuntimeError("boom"))
+        mock_vc.play.side_effect = _play
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_timeout_tasks[111] = MagicMock()
+
+        with caplog.at_level(logging.INFO):
+            with patch("discord.FFmpegPCMAudio"), \
+                 patch("discord.PCMVolumeTransformer", side_effect=lambda s, **kw: s):
+                result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
+
+        assert result is True  # existing success semantics unchanged
+        records = _lifecycle_records(caplog)
+        assert len(records) == 1, "expected exactly one lifecycle log for this attempt"
+        rec = records[0]
+        assert rec["outcome"] == "callback_error"
+        assert rec["callback_reached"] is True
+        assert rec["error_class"] == "RuntimeError"
+        assert "error_message" not in rec  # only the class name is a safe, bounded value
+        assert rec["playback_id"]
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_callback_text_never_reaches_lifecycle_record(self, caplog):
+        """Free-text exception messages can carry paths/secrets/PII; only the
+        bounded exception class name may appear in the lifecycle record."""
+        adapter = self._make_discord_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+
+        secret_marker = "leaked-session-token-9f3e7c21"
+
+        def _play(_source, after):
+            after(RuntimeError(f"ffmpeg failed reading /home/user/.secrets/{secret_marker}"))
+        mock_vc.play.side_effect = _play
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_timeout_tasks[111] = MagicMock()
+
+        with caplog.at_level(logging.INFO):
+            with patch("discord.FFmpegPCMAudio"), \
+                 patch("discord.PCMVolumeTransformer", side_effect=lambda s, **kw: s):
+                result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
+
+        assert result is True
+        records = _lifecycle_records(caplog)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["outcome"] == "callback_error"
+        assert rec["error_class"] == "RuntimeError"
+        assert secret_marker not in json.dumps(rec)
+        assert "/home/user/.secrets" not in json.dumps(rec)
+        # No log path — lifecycle record or any other logger call — may leak
+        # the raw callback exception text (paths/secrets/PII risk).
+        for record in caplog.records:
+            assert secret_marker not in record.getMessage()
+            assert "/home/user/.secrets" not in record.getMessage()
+        assert secret_marker not in caplog.text
+        assert "/home/user/.secrets" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_mixer_decode_failure_falls_back_to_single_legacy_record(self, caplog):
+        """Mixer decode failure + legacy fallback is one attempt: exactly one
+        lifecycle record, carrying the eventual legacy outcome only."""
+        adapter = self._make_discord_adapter()
+        adapter._voice_fx_cfg = {"speech_gain": 1.0}
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+
+        def _play(_source, after):
+            after(None)
+        mock_vc.play.side_effect = _play
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_timeout_tasks[111] = MagicMock()
+        adapter._voice_mixers = {111: MagicMock()}
+
+        try:
+            import voice_mixer as _vm
+        except ImportError:
+            from plugins.platforms.discord import voice_mixer as _vm
+
+        with caplog.at_level(logging.INFO):
+            with patch.object(_vm, "decode_to_pcm", return_value=None), \
+                 patch("discord.FFmpegPCMAudio"), \
+                 patch("discord.PCMVolumeTransformer", side_effect=lambda s, **kw: s):
+                result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
+
+        assert result is True
+        records = _lifecycle_records(caplog)
+        assert len(records) == 1, "mixer decode failure + legacy fallback must yield one record, not two"
+        rec = records[0]
+        assert rec["outcome"] == "completed"
+        assert rec["path"] == "legacy"
+        assert rec["playback_id"]
+
+    @pytest.mark.asyncio
+    async def test_no_callback_logs_timeout_outcome(self, caplog):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        adapter = self._make_discord_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+        # play() never invokes after -> done never set -> must time out.
+        mock_vc.play = MagicMock()
+        mock_vc.stop = MagicMock()
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_timeout_tasks[111] = MagicMock()
+
+        original_timeout = DiscordAdapter.PLAYBACK_TIMEOUT
+        DiscordAdapter.PLAYBACK_TIMEOUT = 0.1
+        try:
+            with caplog.at_level(logging.INFO):
+                with patch("discord.FFmpegPCMAudio"), \
+                     patch("discord.PCMVolumeTransformer", side_effect=lambda s, **kw: s):
+                    result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
+        finally:
+            DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
+
+        assert result is True  # existing success semantics unchanged
+        mock_vc.stop.assert_called()
+        records = _lifecycle_records(caplog)
+        assert len(records) == 1, "expected exactly one lifecycle log for this attempt"
+        rec = records[0]
+        assert rec["outcome"] == "timeout"
+        assert rec["callback_reached"] is False
+        assert rec["stop_issued"] is True
+        assert rec["playback_id"]
 
 
 # =====================================================================
