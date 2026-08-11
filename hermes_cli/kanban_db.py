@@ -1364,6 +1364,58 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_decisions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('presentation_pending', 'pending', 'resolved', 'cancelled', 'superseded')),
+    owner_user_id TEXT NOT NULL CHECK(owner_user_id <> '' AND owner_user_id NOT GLOB '*[^0-9]*'),
+    platform TEXT NOT NULL DEFAULT 'discord',
+    chat_id TEXT,
+    message_id TEXT,
+    choices_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    presented_at INTEGER,
+    resolved_at INTEGER,
+    response_kind TEXT,
+    response_choice TEXT,
+    response_message_id TEXT,
+    resolver_user_id TEXT,
+    rider_text TEXT,
+    superseded_by TEXT,
+    cancel_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kanban_decisions_active_task
+    ON kanban_decisions(task_id) WHERE status IN ('presentation_pending', 'pending');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kanban_decisions_presentation
+    ON kanban_decisions(platform, chat_id, message_id) WHERE message_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS kanban_decision_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_decision_audit_decision ON kanban_decision_audit(decision_id, id);
+CREATE TRIGGER IF NOT EXISTS kanban_decision_hold_status
+BEFORE UPDATE OF status ON tasks
+WHEN NEW.status <> 'blocked'
+ AND EXISTS (
+    SELECT 1 FROM kanban_decisions
+    WHERE task_id = OLD.id AND status IN ('presentation_pending', 'pending')
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'task has a pending owner decision');
+END;
+CREATE TRIGGER IF NOT EXISTS kanban_decision_hold_delete
+BEFORE DELETE ON tasks
+WHEN EXISTS (
+    SELECT 1 FROM kanban_decisions
+    WHERE task_id = OLD.id AND status IN ('presentation_pending', 'pending')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'task has a pending owner decision');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -4173,6 +4225,8 @@ def recompute_ready(
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            if _has_pending_decision(conn, task_id):
+                continue
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
@@ -4239,6 +4293,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4904,6 +4960,8 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5852,6 +5910,8 @@ def promote_task(
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _has_pending_decision(conn, task_id):
+        return False, "task has a pending owner decision"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -5881,6 +5941,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return False, "task has a pending owner decision"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -5898,6 +5960,101 @@ def promote_task(
     return True, None
 
 
+def _has_pending_decision(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM kanban_decisions WHERE task_id=? AND status IN ('presentation_pending', 'pending')",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _append_decision_audit(conn: sqlite3.Connection, decision_id: str, kind: str, payload: Optional[dict] = None) -> None:
+    conn.execute(
+        "INSERT INTO kanban_decision_audit (decision_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+        (decision_id, kind, json.dumps(payload, sort_keys=True) if payload else None, int(time.time())),
+    )
+
+
+def _numeric_id(value: object) -> Optional[str]:
+    value = str(value).strip()
+    return value if value.isascii() and value.isdecimal() else None
+
+
+def create_owner_decision(conn: sqlite3.Connection, task_id: str, *, owner_user_id: str, choices: list[str]) -> dict:
+    owner = _numeric_id(owner_user_id)
+    choices = [str(choice).strip() for choice in choices]
+    if owner is None:
+        raise ValueError("owner_user_id must be numeric")
+    if not choices or any(not choice for choice in choices) or len(set(choices)) != len(choices):
+        raise ValueError("choices must be unique non-empty keys")
+    decision = {"id": f"d_{secrets.token_hex(8)}", "task_id": task_id, "choices": choices}
+    with write_txn(conn):
+        task = conn.execute("SELECT status, block_kind FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task["status"] != "blocked" or task["block_kind"] != "needs_input":
+            raise ValueError("decision requires a needs_input blocked task")
+        conn.execute(
+            "INSERT INTO kanban_decisions (id, task_id, status, owner_user_id, choices_json, created_at) VALUES (?, ?, 'presentation_pending', ?, ?, ?)",
+            (decision["id"], task_id, owner, json.dumps(choices, separators=(",", ":")), int(time.time())),
+        )
+        _append_decision_audit(conn, decision["id"], "created", {"task_id": task_id, "choices": choices})
+    return decision
+
+
+def bind_decision_presentation(conn: sqlite3.Connection, decision_id: str, *, chat_id: str, message_id: str) -> bool:
+    numeric_chat_id = _numeric_id(chat_id)
+    numeric_message_id = _numeric_id(message_id)
+    if numeric_chat_id is None or numeric_message_id is None:
+        raise ValueError("chat_id and message_id must be numeric")
+    with write_txn(conn):
+        row = conn.execute("SELECT status, platform, chat_id, message_id FROM kanban_decisions WHERE id=?", (decision_id,)).fetchone()
+        if not row:
+            return False
+        if row["status"] == "pending":
+            return row["platform"] == "discord" and row["chat_id"] == numeric_chat_id and row["message_id"] == numeric_message_id
+        cur = conn.execute("UPDATE kanban_decisions SET status='pending', platform='discord', chat_id=?, message_id=?, presented_at=? WHERE id=? AND status='presentation_pending'", (numeric_chat_id, numeric_message_id, int(time.time()), decision_id))
+        if cur.rowcount != 1:
+            return False
+        _append_decision_audit(conn, decision_id, "presented", {"chat_id": numeric_chat_id, "message_id": numeric_message_id})
+        return True
+
+
+def cancel_owner_decision(conn: sqlite3.Connection, decision_id: str, *, reason: str) -> bool:
+    with write_txn(conn):
+        cur = conn.execute("UPDATE kanban_decisions SET status='cancelled', cancel_reason=? WHERE id=? AND status IN ('presentation_pending', 'pending')", (reason[:200], decision_id))
+        if cur.rowcount != 1:
+            return False
+        _append_decision_audit(conn, decision_id, "cancelled", {"reason": reason[:200]})
+        return True
+
+
+def resolve_discord_decision(conn: sqlite3.Connection, decision_id: str, *, task_id: str, chat_id: str, message_id: str, resolver_user_id: str, choice: str, response_message_id: str, rider_text: Optional[str] = None, response_kind: str = "reply") -> dict:
+    rider = " ".join((rider_text or "").split())
+    if len(rider.encode()) > 500:
+        return {"resolved": False, "reason": "rider_too_long"}
+    if response_kind not in {"reply", "button"}:
+        return {"resolved": False, "reason": "invalid_response_kind"}
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM kanban_decisions WHERE id=?", (decision_id,)).fetchone()
+        if not row or row["status"] != "pending":
+            return {"resolved": False, "reason": "stale"}
+        if (row["task_id"], row["platform"], row["chat_id"], row["message_id"], row["owner_user_id"]) != (task_id, "discord", str(chat_id), str(message_id), str(resolver_user_id)) or choice not in json.loads(row["choices_json"]):
+            _append_decision_audit(conn, decision_id, "rejected", {"reason": "binding_or_owner_or_choice"})
+            return {"resolved": False, "reason": "rejected"}
+        cur = conn.execute("UPDATE kanban_decisions SET status='resolved', resolved_at=?, response_kind=?, response_choice=?, response_message_id=?, resolver_user_id=?, rider_text=? WHERE id=? AND status='pending'", (int(time.time()), response_kind, choice, str(response_message_id), str(resolver_user_id), rider or None, decision_id))
+        if cur.rowcount != 1 or not _resolve_unblock_in_txn(conn, task_id):
+            raise RuntimeError("decision resolution could not unblock held task")
+        _append_decision_audit(conn, decision_id, "resolved", {"choice": choice, "response_message_id": str(response_message_id)})
+        _append_event(conn, task_id, "decision_resolved", {"decision_id": decision_id, "choice": choice})
+        return {"resolved": True}
+
+
+def get_pending_discord_decisions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, task_id, choices_json, chat_id, message_id FROM kanban_decisions "
+        "WHERE status='pending' AND platform='discord' AND chat_id IS NOT NULL "
+        "AND message_id IS NOT NULL"
+    ).fetchall()
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -5910,6 +6067,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -5962,6 +6121,24 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def _resolve_unblock_in_txn(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Resolver-only unblock path; caller already owns the decision transaction."""
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status != 'done' LIMIT 1", (task_id,),
+    ).fetchone()
+    status = "todo" if undone else "ready"
+    cur = conn.execute(
+        "UPDATE tasks SET status=?, current_run_id=NULL, consecutive_failures=0, last_failure_error=NULL "
+        "WHERE id=? AND status='blocked' AND block_kind='needs_input'",
+        (status, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(conn, task_id, "unblocked", {"status": status, "via": "decision"})
+    return True
 
 
 def specify_triage_task(
@@ -6290,6 +6467,8 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -6351,6 +6530,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if _has_pending_decision(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

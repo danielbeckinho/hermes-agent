@@ -92,6 +92,7 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
 })
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
+_KANBAN_DECISION_REPLY_RE = re.compile(r"^([A-Za-z0-9_-]+)(?:: (.+))?$")
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -1332,6 +1333,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
+                adapter_self._register_pending_kanban_decision_views()
                 adapter_self._ready_event.set()
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
@@ -1505,9 +1507,60 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if not admitted:
             return False
+        if self._try_resolve_kanban_decision_reply(message):
+            return True
         return await self._handle_message(
             message, role_authorized=role_authorized,
         )
+
+    def _try_resolve_kanban_decision_reply(self, message: Any) -> bool:
+        """Consume an exact owner reply to a persisted Kanban decision."""
+        reference = getattr(message, "reference", None)
+        target_id = str(getattr(reference, "message_id", "") or "")
+        channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        match = _KANBAN_DECISION_REPLY_RE.fullmatch(str(getattr(message, "content", "")).strip())
+        if not target_id or not channel_id or not match:
+            return False
+        choice, rider = match.groups()
+        try:
+            from hermes_cli import kanban_db as kb
+
+            with kb.connect_closing() as conn:
+                row = conn.execute(
+                    "SELECT id, task_id FROM kanban_decisions WHERE status='pending' "
+                    "AND platform='discord' AND chat_id=? AND message_id=?",
+                    (channel_id, target_id),
+                ).fetchone()
+                if not row:
+                    return False
+                result = kb.resolve_discord_decision(
+                    conn, row["id"], task_id=row["task_id"], chat_id=channel_id,
+                    message_id=target_id, resolver_user_id=str(message.author.id),
+                    choice=choice, response_message_id=str(message.id), rider_text=rider,
+                )
+                return bool(result["resolved"])
+        except Exception:
+            logger.warning("[%s] Kanban decision reply was not resolved", self.name, exc_info=True)
+            return False
+
+    def _register_pending_kanban_decision_views(self) -> None:
+        """Restore persistent Discord controls from the authoritative board."""
+        if not self._client:
+            return
+        try:
+            from hermes_cli import kanban_db as kb
+
+            with kb.connect_closing() as conn:
+                decisions = kb.get_pending_discord_decisions(conn)
+            for decision in decisions:
+                self._client.add_view(
+                    KanbanDecisionView(
+                        decision["id"], json.loads(decision["choices_json"]),
+                    ),
+                    message_id=int(decision["message_id"]),
+                )
+        except Exception:
+            logger.warning("[%s] Kanban decision buttons were not restored", self.name, exc_info=True)
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -8478,7 +8531,57 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, KanbanDecisionView
+
+    class KanbanDecisionView(discord.ui.View):
+        """Persistent controls backed solely by one Kanban decision record."""
+
+        def __init__(self, decision_id: str, choices: list[str]):
+            super().__init__(timeout=None)
+            self.decision_id = decision_id
+            for choice in choices:
+                button = discord.ui.Button(
+                    label=choice,
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"kanban-decision:{decision_id}:{choice}",
+                )
+                button.callback = self._callback(choice)
+                self.add_item(button)
+
+        def _callback(self, choice: str):
+            async def callback(interaction: discord.Interaction):
+                try:
+                    from hermes_cli import kanban_db as kb
+
+                    with kb.connect_closing() as conn:
+                        row = conn.execute(
+                            "SELECT task_id FROM kanban_decisions WHERE id=?",
+                            (self.decision_id,),
+                        ).fetchone()
+                        result = kb.resolve_discord_decision(
+                            conn, self.decision_id,
+                            task_id=row["task_id"] if row else "",
+                            chat_id=str(interaction.channel_id),
+                            message_id=str(interaction.message.id),
+                            resolver_user_id=str(interaction.user.id),
+                            choice=choice,
+                            response_message_id=str(interaction.id),
+                            response_kind="button",
+                        )
+                except Exception:
+                    logger.warning("Kanban decision button was not resolved", exc_info=True)
+                    result = {"resolved": False}
+                if not result.get("resolved"):
+                    await interaction.response.send_message(
+                        "This decision is unavailable or you are not its owner.",
+                        ephemeral=True,
+                    )
+                    return
+                for child in self.children:
+                    child.disabled = True
+                await interaction.response.edit_message(view=self)
+
+            return callback
 
     class ExecApprovalView(discord.ui.View):
         """
