@@ -109,6 +109,17 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Discord Kanban lifecycle delivery
+# ---------------------------------------------------------------------------
+# Channel IDs per owner decision (2026-08-11).
+_HERMES_CHANNEL_ID = "1536516305803550832"
+_DECISIONS_CHANNEL_ID = "1536516701972205668"
+
+# Event kinds that warrant best-effort VC speech.
+_LIFECYCLE_VOICE_KINDS = ("completed", "blocked", "block_loop_detected")
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -121,6 +132,118 @@ class GatewayKanbanWatchersMixin:
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
+
+    async def _kanban_lifecycle_subscribe_new_cards(
+        self, boards: list[dict],
+    ) -> None:
+        """Auto-subscribe new cards to #hermes via existing kanban_notify_subs.
+
+        Polls each board's ``task_events`` for ``created`` events after a
+        per-board cursor tracked in ``self._kanban_lifecycle_created_cursor``
+        (board slug → last event id). For each new card, inserts a
+        ``kanban_notify_subs`` row so the existing notifier loop delivers its
+        lifecycle events to #hermes. No new DB schema, no new config keys.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        cursors: dict[str, int] = getattr(
+            self, "_kanban_lifecycle_created_cursor", {}
+        )
+        self._kanban_lifecycle_created_cursor = cursors
+
+        def _tick() -> None:
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                after_id = cursors.get(slug, 0)
+                try:
+                    conn = _kb.connect(board=slug)
+                except Exception:
+                    continue
+                try:
+                    rows = conn.execute(
+                        "SELECT id, task_id FROM task_events "
+                        "WHERE id > ? AND kind = 'created' ORDER BY id ASC",
+                        (after_id,),
+                    ).fetchall()
+                    new_cursor = after_id
+                    for row in rows:
+                        try:
+                            _kb.add_notify_sub(
+                                conn,
+                                task_id=row["task_id"],
+                                platform="discord",
+                                chat_id=_HERMES_CHANNEL_ID,
+                                notifier_profile=getattr(
+                                    self, "_kanban_notifier_profile", None,
+                                ),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "kanban lifecycle: auto-subscribe failed for %s",
+                                row["task_id"],
+                            )
+                        new_cursor = max(new_cursor, row["id"])
+                    cursors[slug] = new_cursor
+                finally:
+                    conn.close()
+
+        await asyncio.to_thread(_tick)
+
+    async def _kanban_lifecycle_send_decision(
+        self, task, ev, board_slug: Optional[str],
+    ) -> None:
+        """Send a bounded decision brief to #decisions. Best-effort.
+
+        Dedup via in-memory ``self._kanban_lifecycle_decision_sent`` set keyed
+        by ``(board, event id)`` so a watcher restart never duplicates a
+        brief that was already sent; a failed send removes the key so the next
+        tick retries.
+        """
+        from gateway.config import Platform as _Platform
+
+        adapter = self.adapters.get(_Platform.DISCORD)
+        if adapter is None:
+            return
+
+        sent: set = getattr(self, "_kanban_lifecycle_decision_sent", set())
+        self._kanban_lifecycle_decision_sent = sent
+        event_key = f"{board_slug or ''}:{ev.id}"
+        if event_key in sent:
+            return
+        sent.add(event_key)
+
+        task_id = ev.task_id
+        title = (task.title if task else task_id)[:120]
+        reason = str((ev.payload or {}).get("reason") or "no reason given")[:300]
+        board_tag = f"[{board_slug}] " if board_slug else ""
+        text = (
+            f"🗳️ {board_tag}Decision needed — Kanban {task_id}: {title}\n"
+            f"Blocked: {reason}\n"
+            f"Reply to this message naming task {task_id} with your choice."
+        )
+        try:
+            res = await adapter.send(_DECISIONS_CHANNEL_ID, text)
+            if not getattr(res, "success", True):
+                sent.discard(event_key)
+        except Exception:
+            sent.discard(event_key)
+
+    async def _kanban_lifecycle_speak(self, adapter, task, ev) -> None:
+        """Best-effort VC speech. No-op unless adapter exposes speak_kanban_notice."""
+        speak = getattr(adapter, "speak_kanban_notice", None)
+        if speak is None:
+            return
+        task_id = ev.task_id
+        if ev.kind == "completed":
+            phrase = f"Task {task_id} completed."
+        elif ev.kind == "blocked":
+            phrase = f"Task {task_id} needs your input."
+        else:
+            phrase = f"Task {task_id} needs a decision."
+        try:
+            await speak(phrase)
+        except Exception:
+            pass
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -354,6 +477,24 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                     return deliveries
 
+                # Auto-subscribe new cards to #hermes before processing
+                # subscriptions, so a freshly created card's lifecycle events
+                # are picked up by the normal notifier path below. No-op unless
+                # a Discord adapter is actually connected.
+                if "discord" in {
+                    getattr(platform, "value", str(platform)).lower()
+                    for platform in self.adapters.keys()
+                }:
+                    from hermes_cli import kanban_db as _kb_sub
+                    try:
+                        _boards = _kb_sub.list_boards(include_archived=False)
+                    except Exception:
+                        _boards = [_kb_sub.read_board_metadata(_kb_sub.DEFAULT_BOARD)]
+                    try:
+                        await self._kanban_lifecycle_subscribe_new_cards(_boards)
+                    except Exception as exc:
+                        logger.debug("kanban lifecycle subscribe tick failed: %s", exc)
+
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
@@ -491,6 +632,19 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        # --- Lifecycle: decision brief for needs_input / block_loop_detected ---
+                        if (
+                            kind == "blocked"
+                            and ev.payload
+                            and ev.payload.get("kind") == "needs_input"
+                        ) or kind == "block_loop_detected":
+                            try:
+                                await self._kanban_lifecycle_send_decision(
+                                    task, ev, board_slug,
+                                )
+                            except Exception:
+                                pass
+
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -770,6 +924,14 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
+                        # --- Lifecycle: best-effort VC speech after text delivery ---
+                        for ev in d["events"]:
+                            if ev.kind in _LIFECYCLE_VOICE_KINDS:
+                                try:
+                                    await self._kanban_lifecycle_speak(adapter, task, ev)
+                                except Exception:
+                                    pass
+
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,

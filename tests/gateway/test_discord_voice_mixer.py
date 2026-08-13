@@ -163,3 +163,42 @@ class TestPlayAckInVoice:
         assert await adapter.play_ack_in_voice(111) is False
 
 
+class TestSpeakKanbanNotice:
+    @pytest.mark.asyncio
+    async def test_noop_when_no_voice_channel(self):
+        adapter = _make_adapter()
+        adapter._allowed_user_ids = {"123"}
+        assert await adapter.speak_kanban_notice("hello") is False
+
+    @pytest.mark.asyncio
+    async def test_noop_when_owner_absent(self):
+        adapter = _make_adapter()
+        adapter._allowed_user_ids = {"123"}
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        adapter.get_voice_channel_info = MagicMock(
+            return_value={"members": [{"user_id": "999"}]},
+        )
+        assert await adapter.speak_kanban_notice("hello") is False
+
+    @pytest.mark.asyncio
+    async def test_plays_when_owner_present(self):
+        adapter = _make_adapter()
+        adapter._allowed_user_ids = {"123"}
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        adapter._voice_clients[111] = vc
+        adapter.get_voice_channel_info = MagicMock(
+            return_value={"members": [{"user_id": "123"}]},
+        )
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+
+        with patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value='{"success": true, "file_path": "/tmp/fake.mp3"}',
+        ), patch("os.path.isfile", return_value=True):
+            assert await adapter.speak_kanban_notice("task done") is True
+        adapter.play_in_voice_channel.assert_awaited_once()
+
+

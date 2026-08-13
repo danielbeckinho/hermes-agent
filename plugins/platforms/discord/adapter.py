@@ -4191,6 +4191,53 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    async def speak_kanban_notice(self, text: str) -> bool:
+        """Speak a Kanban lifecycle notice, iff already in a VC with an owner.
+
+        No-op unless the bot is already connected to a voice channel
+        containing at least one user from the existing allowed-users list.
+        Never joins, moves, or disconnects a voice channel. Synthesis and
+        playback route through existing adapter methods.
+        """
+        allowed = getattr(self, "_allowed_user_ids", set()) or set()
+        target_guild_id = None
+        for guild_id in list(getattr(self, "_voice_clients", {}).keys()):
+            info = self.get_voice_channel_info(guild_id)
+            if info and any(
+                str(m["user_id"]) in allowed for m in info["members"]
+            ):
+                target_guild_id = guild_id
+                break
+        if target_guild_id is None:
+            return False
+
+        import uuid as _uuid
+        audio_path = os.path.join(
+            tempfile.gettempdir(), "hermes_voice",
+            f"kanban_{_uuid.uuid4().hex[:12]}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        try:
+            from tools.tts_tool import text_to_speech_tool
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool, text=text, output_path=audio_path,
+            )
+            result = json.loads(result_json)
+            actual = result.get("file_path", audio_path)
+            if not result.get("success") or not os.path.isfile(actual):
+                return False
+            return await self.play_in_voice_channel(target_guild_id, actual)
+        except Exception as e:
+            logger.debug("speak_kanban_notice failed: %s", type(e).__name__)
+            return False
+        finally:
+            for p in {audio_path, locals().get("actual")}:
+                if p and os.path.isfile(p):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
 
