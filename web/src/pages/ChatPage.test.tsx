@@ -65,6 +65,10 @@ class FakeTerminal {
 }
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
+const apiMocks = vi.hoisted(() => ({
+  buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  fetchJSON: vi.fn(async () => ({ data_url: "data:audio/wav;base64,AA==" })),
+}));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
 vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
@@ -115,6 +119,11 @@ vi.mock("@/i18n", () => ({
 vi.mock("@/lib/dashboard-auth-reload", () => ({
   maybeReloadForLoopbackWsAuthFailure,
 }));
+vi.mock("@/lib/api", () => ({
+  api: apiMocks,
+  buildWsUrl: apiMocks.buildWsUrl,
+  fetchJSON: apiMocks.fetchJSON,
+}));
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -157,6 +166,8 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  apiMocks.fetchJSON.mockReset();
+  apiMocks.fetchJSON.mockResolvedValue({ data_url: "data:audio/wav;base64,AA==" });
   sidebarState.current = {};
   voiceState.onTranscript = null;
   vi.stubGlobal("fetch", vi.fn(async () => ({
@@ -235,7 +246,10 @@ describe("ChatPage", () => {
     sidebarState.current.onMessageStart?.({ voice_turn: false });
     sidebarState.current.onMessageComplete?.({ text: "unrelated reply", voice_turn: false });
     await Promise.resolve();
-    expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining("/api/audio/speak"), expect.anything());
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/audio/speak"),
+      expect.anything(),
+    );
   });
 
   it("speaks a completion carrying the voice marker", async () => {
@@ -245,7 +259,10 @@ describe("ChatPage", () => {
     voiceState.onTranscript?.("voice prompt");
     sidebarState.current.onMessageStart?.({ voice_turn: true });
     sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    await vi.waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/audio/speak"), expect.anything()));
+    await vi.waitFor(() => expect(apiMocks.fetchJSON).toHaveBeenCalledWith(
+      expect.stringContaining("/api/audio/speak"),
+      expect.anything(),
+    ));
   });
 
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
