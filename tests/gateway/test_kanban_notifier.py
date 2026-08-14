@@ -516,3 +516,111 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def _make_discord_runner(adapter):
+    """Runner with a Discord adapter wired for lifecycle delivery tests."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+    return runner
+
+
+def test_lifecycle_auto_subscribes_new_cards(tmp_path, monkeypatch):
+    """A created card is auto-subscribed to #hermes for lifecycle delivery."""
+    from gateway.kanban_watchers import _HERMES_CHANNEL_ID
+
+    db_path = tmp_path / "lifecycle-autosub.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="new card", assignee="worker")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The created card must now carry a Discord subscription to #hermes.
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert any(
+        s["platform"] == "discord" and s["chat_id"] == _HERMES_CHANNEL_ID
+        for s in subs
+    ), f"new card not auto-subscribed to #hermes; subs={subs}"
+
+
+def test_lifecycle_routes_needs_input_to_decisions(tmp_path, monkeypatch):
+    """A needs_input block sends a decision brief to #decisions."""
+    from gateway.kanban_watchers import (
+        _DECISIONS_CHANNEL_ID,
+        _HERMES_CHANNEL_ID,
+    )
+
+    db_path = tmp_path / "lifecycle-decisions.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a call", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id=_HERMES_CHANNEL_ID,
+        )
+        kb.block_task(conn, tid, reason="pick a path", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    decision_msgs = [
+        d for d in adapter.sent if d["chat_id"] == _DECISIONS_CHANNEL_ID
+    ]
+    assert len(decision_msgs) == 1, (
+        f"expected exactly one decision brief, got {len(decision_msgs)}"
+    )
+    assert tid in decision_msgs[0]["text"]
+    assert "pick a path" in decision_msgs[0]["text"]
+
+
+def test_lifecycle_ignores_non_needs_input_blocks(tmp_path, monkeypatch):
+    """A capability/transient block sends no decision brief."""
+    from gateway.kanban_watchers import (
+        _DECISIONS_CHANNEL_ID,
+        _HERMES_CHANNEL_ID,
+    )
+
+    db_path = tmp_path / "lifecycle-nobrief.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked other", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id=_HERMES_CHANNEL_ID,
+        )
+        kb.block_task(conn, tid, reason="no credentials", kind="capability")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    decision_msgs = [
+        d for d in adapter.sent if d["chat_id"] == _DECISIONS_CHANNEL_ID
+    ]
+    assert decision_msgs == []
