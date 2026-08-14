@@ -56,6 +56,19 @@ let getUserMedia: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   fetchJSON.mockReset();
   fetchJSON.mockResolvedValue({ transcript: "voice input" });
+  // jsdom in this pool has no localStorage (about:blank document URL), so
+  // stub a minimal in-memory implementation — mirrors the try/catch
+  // defensiveness the component uses around window.localStorage.
+  const localStorageStore = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    clear: () => localStorageStore.clear(),
+    getItem: (key: string) =>
+      localStorageStore.has(key) ? localStorageStore.get(key)! : null,
+    removeItem: (key: string) => localStorageStore.delete(key),
+    setItem: (key: string, value: string) => {
+      localStorageStore.set(key, value);
+    },
+  });
   FakeRecorder.instances = [];
   FakeAudioContext.instances = [];
   getUserMedia = vi.fn(async () => new FakeStream());
@@ -135,7 +148,7 @@ describe("PushToTalkButton", () => {
     const recorder = FakeRecorder.instances[0];
     recorder.emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input"));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
     expect(FakeAudioContext.instances).toHaveLength(2);
     expect(recorder.stream.track.stop).toHaveBeenCalled();
   });
@@ -199,6 +212,33 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
     FakeRecorder.instances[0].emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new KeyboardEvent("keyup", { key: " ", bubbles: true })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input"));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
+  });
+
+  function autoSendToggle() {
+    return container.querySelector(
+      'input[aria-label="Auto-send voice transcript"]',
+    ) as HTMLInputElement | null;
+  }
+
+  it("defaults the auto-send toggle to checked when no preference is stored", async () => {
+    await render();
+    expect(autoSendToggle()?.checked).toBe(true);
+  });
+
+  it("loads a stored manual preference as unchecked on mount", async () => {
+    window.localStorage.setItem("hermes.voice.autoSend", "0");
+    await render();
+    expect(autoSendToggle()?.checked).toBe(false);
+  });
+
+  it("persists a toggle change and passes it on the next transcript", async () => {
+    const onTranscript = await render();
+    await act(async () => autoSendToggle()?.click());
+    expect(window.localStorage.getItem("hermes.voice.autoSend")).toBe("0");
+    await startRecording();
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", false));
   });
 });
