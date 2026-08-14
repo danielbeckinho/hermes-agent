@@ -62,6 +62,20 @@ class TestHostHeaderMiddleware:
     """End-to-end test via the FastAPI app — verify the middleware
     rejects bad Host headers with 400."""
 
+    def test_bad_host_is_rejected_before_chat_auth_redirect(self, monkeypatch):
+        """The Host guard must run before the gated HTML auth redirect."""
+        from fastapi.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "100.81.246.101", raising=False)
+        monkeypatch.setattr(ws.app.state, "auth_required", True, raising=False)
+
+        response = TestClient(ws.app).get(
+            "/chat", headers={"Host": "evil.example"}, follow_redirects=False
+        )
+
+        assert response.status_code == 400
+
     def test_rebinding_request_rejected(self):
         from fastapi.testclient import TestClient
         from hermes_cli.web_server import app

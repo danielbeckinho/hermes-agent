@@ -536,7 +536,6 @@ def _is_accepted_host(
     return host_only == bound_lc or host_only in allowed_hosts
 
 
-@app.middleware("http")
 async def host_header_middleware(request: Request, call_next):
     """Reject requests whose Host header doesn't match the bound interface.
 
@@ -639,8 +638,8 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 # Dashboard OAuth auth gate — engaged only when start_server flags the
 # bind as non-loopback-without-insecure.  No-op pass-through in loopback
 # mode so the legacy auth_middleware (below) handles those binds via
-# the injected ``_SESSION_TOKEN``.  Registered between host_header and
-# auth_middleware so the order is: host check → cookie auth → token auth.
+# the injected ``_SESSION_TOKEN``. The host guard is registered last below so
+# it executes before these auth layers.
 # ---------------------------------------------------------------------------
 
 
@@ -753,12 +752,11 @@ DASHBOARD_HEALTH = DashboardHealth()
 
 @app.middleware("http")
 async def _dashboard_health_middleware(request: Request, call_next):
-    """Outermost middleware: count unhandled exceptions and 5xx responses.
+    """Count unhandled exceptions and 5xx responses.
 
-    Registered after ``_token_auth_seam`` so it is the outermost layer
-    (Starlette middleware is outermost-last) — nothing below can raise past
-    it unseen.  Records into :data:`DASHBOARD_HEALTH` and re-raises; never
-    swallows or alters the response.
+    Registered after ``_token_auth_seam``. Records into
+    :data:`DASHBOARD_HEALTH` and re-raises; never swallows or alters the
+    response.
     """
     try:
         response = await call_next(request)
@@ -768,6 +766,11 @@ async def _dashboard_health_middleware(request: Request, call_next):
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
     return response
+
+
+# Register last: Starlette executes the most recently registered middleware
+# first, so malformed Hosts are rejected before any auth redirect.
+app.middleware("http")(host_header_middleware)
 
 
 # ---------------------------------------------------------------------------
