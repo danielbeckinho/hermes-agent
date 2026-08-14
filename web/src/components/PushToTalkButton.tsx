@@ -22,6 +22,23 @@ function dataUrl(blob: Blob): Promise<string> {
   });
 }
 
+function playCue(frequency: number): void {
+  try {
+    const context = new AudioContext();
+    const gain = context.createGain();
+    const oscillator = context.createOscillator();
+    gain.gain.setValueAtTime(0.025, context.currentTime);
+    oscillator.frequency.setValueAtTime(frequency, context.currentTime);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.onended = () => void context.close();
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.06);
+  } catch {
+    // Audio cues are optional feedback; recording must still work without Web Audio.
+  }
+}
+
 export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -29,13 +46,17 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const holdingRef = useRef(false);
   const disposedRef = useRef(false);
   const recordingRef = useRef(false);
-  const [recording, setRecording] = useState(false);
+  const [state, setState] = useState<"idle" | "requesting" | "recording">("idle");
 
   const release = useCallback(() => {
     holdingRef.current = false;
-    if (!recordingRef.current) return;
+    if (!recordingRef.current) {
+      setState("idle");
+      return;
+    }
     recordingRef.current = false;
-    setRecording(false);
+    setState("idle");
+    playCue(440);
     recorderRef.current?.stop();
   }, []);
 
@@ -43,6 +64,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     if (requestingRef.current || recordingRef.current) return;
     holdingRef.current = true;
     requestingRef.current = true;
+    setState("requesting");
     let stream: MediaStream | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -81,9 +103,11 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
       };
       recorder.start();
       recordingRef.current = true;
-      setRecording(true);
+      setState("recording");
+      playCue(660);
     } catch {
       stopTracks(stream);
+      setState("idle");
     } finally {
       requestingRef.current = false;
     }
@@ -92,6 +116,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   useEffect(() => () => {
     disposedRef.current = true;
     holdingRef.current = false;
+    if (recordingRef.current) playCue(440);
     recordingRef.current = false;
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
     stopTracks(streamRef.current);
@@ -102,9 +127,10 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   return (
     <Button
       type="button"
-      aria-label="Hold to talk"
-      aria-pressed={recording}
-      className="absolute bottom-2 left-2 z-10 rounded border border-current/30 bg-black/20 px-2 py-1 text-xs opacity-80 hover:opacity-100 sm:bottom-3 sm:left-3"
+      aria-label={state === "requesting" ? "Requesting microphone" : state === "recording" ? "Recording. Release to send" : "Hold to talk"}
+      aria-pressed={state === "recording"}
+      aria-busy={state === "requesting"}
+      className={`absolute bottom-2 left-2 z-10 rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${state === "recording" ? "border-red-400 bg-red-950" : state === "requesting" ? "border-yellow-300 bg-yellow-950" : "border-white/70 bg-black"} sm:bottom-3 sm:left-3`}
       onKeyDown={(event) => {
         if (event.key === " " || event.key === "Enter") {
           event.preventDefault();
@@ -127,7 +153,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
       onPointerUp={release}
     >
       <Mic className="size-3" />
-      <span className="ml-1">{recording ? "recording" : "hold to talk"}</span>
+      <span className="ml-1">{state === "idle" ? "hold to talk" : state}</span>
     </Button>
   );
 }
