@@ -140,6 +140,23 @@ describe("ChatSidebar event socket", () => {
       reloadMocks.maybeReloadForLoopbackWsAuthFailure,
     ).toHaveBeenCalledWith(4401);
   });
+
+  it("forwards message completions from its existing events socket", async () => {
+    const { ChatSidebar } = await import("./ChatSidebar");
+    const onMessageComplete = vi.fn();
+
+    await render(<ChatSidebar channel="chat-1" onMessageComplete={onMessageComplete} />);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    FakeWebSocket.instances[0].emit("message", {
+      data: JSON.stringify({
+        method: "event",
+        params: { type: "message.complete", payload: { text: "spoken reply" } },
+      }),
+    });
+
+    expect(onMessageComplete).toHaveBeenCalledWith({ text: "spoken reply" });
+  });
 });
 
 describe("ChatSidebar event socket reconnect", () => {
