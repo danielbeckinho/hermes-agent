@@ -854,8 +854,6 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
-            backend = _get_extract_backend()
-
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
             # registry lookup + delegation. Some providers' extract() is
@@ -864,6 +862,7 @@ async def web_extract_tool(
             # inline (the policy gate, SSRF re-check, etc. live inside the
             # provider itself for the firecrawl per-URL loop).
             _ensure_web_plugins_loaded()
+            backend = _get_extract_backend()
             from agent.web_search_registry import (
                 get_active_extract_provider,
                 get_provider as _wsp_get_provider,
