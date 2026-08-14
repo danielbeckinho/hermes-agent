@@ -167,7 +167,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const pendingVoiceTurnRef = useRef(false);
+  const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -475,14 +475,32 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const handleVoiceTranscript = useCallback((transcript: string) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    pendingVoiceTurnRef.current = true;
-    ws.send(transcript);
+    // Private-use Unicode suffix is consumed by ui-tui before prompt.submit;
+    // ordinary typed input never carries this suffix.
+    pendingVoiceTurnRef.current = "awaiting-start";
+    ws.send(`${transcript}\uE000`);
     ws.send("\r");
   }, []);
 
+  const handleVoiceStart = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current === "awaiting-start"
+      && typeof payload === "object"
+      && payload !== null
+      && (payload as { voice_turn?: unknown }).voice_turn === true
+    ) {
+      pendingVoiceTurnRef.current = "active";
+    }
+  }, []);
+
   const handleVoiceCompletion = useCallback((payload: unknown) => {
-    if (!pendingVoiceTurnRef.current) return;
-    pendingVoiceTurnRef.current = false;
+    if (
+      pendingVoiceTurnRef.current !== "active"
+      || typeof payload !== "object"
+      || payload === null
+      || (payload as { voice_turn?: unknown }).voice_turn !== true
+    ) return;
+    pendingVoiceTurnRef.current = "idle";
     const text = typeof payload === "object" && payload !== null
       ? String((payload as { text?: unknown }).text ?? "").trim()
       : "";
@@ -500,7 +518,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [scopedProfile]);
 
   useEffect(() => () => {
-    pendingVoiceTurnRef.current = false;
+    pendingVoiceTurnRef.current = "idle";
   }, [channel, reconnectNonce, scopedProfile]);
 
   useEffect(() => {
@@ -1515,6 +1533,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
                 onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
@@ -1650,6 +1669,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
                 onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />

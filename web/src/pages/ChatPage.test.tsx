@@ -71,8 +71,19 @@ vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
 vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal }));
+const { sidebarState } = vi.hoisted(() => ({ sidebarState: { current: {} as Record<string, ((payload: unknown) => void) | undefined> } }));
 vi.mock("@/components/ChatSidebar", () => ({
-  ChatSidebar: () => null,
+  ChatSidebar: (props: Record<string, unknown>) => {
+    sidebarState.current = props as typeof sidebarState.current;
+    return null;
+  },
+}));
+const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string) => void) | null } }));
+vi.mock("@/components/PushToTalkButton", () => ({
+  PushToTalkButton: (props: { onTranscript: (text: string) => void }) => {
+    voiceState.onTranscript = props.onTranscript;
+    return null;
+  },
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -116,6 +127,7 @@ class FakeWebSocket {
   readyState = FakeWebSocket.OPEN;
   url: string;
 
+  sent: string[] = [];
   constructor(url: string) {
     this.url = url;
     FakeWebSocket.instances.push(this);
@@ -125,7 +137,7 @@ class FakeWebSocket {
     this.readyState = 3;
   }
 
-  send() {}
+  send(value: string) { this.sent.push(value); }
 }
 
 type CloseEventLike = {
@@ -145,6 +157,15 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  sidebarState.current = {};
+  voiceState.onTranscript = null;
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    status: 200,
+    ok: true,
+    json: async () => ({ data_url: "data:audio/wav;base64,AA==" }),
+    clone() { return this; },
+  })));
+  vi.stubGlobal("Audio", class { play() { return Promise.resolve(); } });
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -206,6 +227,27 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("does not speak an unrelated turn after a voice transcript", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt");
+    sidebarState.current.onMessageStart?.({ voice_turn: false });
+    sidebarState.current.onMessageComplete?.({ text: "unrelated reply", voice_turn: false });
+    await Promise.resolve();
+    expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining("/api/audio/speak"), expect.anything());
+  });
+
+  it("speaks a completion carrying the voice marker", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt");
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/audio/speak"), expect.anything()));
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 

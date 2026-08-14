@@ -199,6 +199,35 @@ def test_continuation_turn_records_attempt_and_original_prompt(
     assert "_auto_continue_prompt" not in session
 
 
+def test_voice_turn_marker_only_marks_correlated_start_and_complete(
+    emits, turn_env, marker_home
+):
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda message, **kwargs: {"final_response": "spoken reply"},
+        clear_interrupt=lambda: None,
+    )
+
+    server._run_prompt_submit(
+        "rid", "sid", _session(agent=agent, running=True), "voice text", voice_turn=True
+    )
+
+    starts = [payload for event, _, payload in emits if event == "message.start"]
+    completes = [payload for event, _, payload in emits if event == "message.complete"]
+    assert starts == [{"voice_turn": True}]
+    assert completes and completes[-1]["voice_turn"] is True
+    assert read_turn_marker(marker_home, "session-key") is None
+
+    emits.clear()
+    server._run_prompt_submit("rid", "sid", _session(agent=agent, running=True), "typed text")
+    assert all(
+        not (isinstance(payload, dict) and payload.get("voice_turn"))
+        for event, _, payload in emits
+        if event in {"message.start", "message.complete"}
+    )
+
+
+
 def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home):
     """An agent whose run_conversation predates turn-start typing keeps the
     original behavior — the row is typed once the turn concludes."""
