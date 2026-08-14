@@ -28,6 +28,20 @@ def test_serve_help_advertises_secure_ssh_bootstrap_flags(capsys):
     assert "--ssh-owner-nonce NONCE" in output
 
 
+def test_dashboard_accepts_repeatable_allowed_host():
+    args = dashboard_parser().parse_args(
+        [
+            "dashboard",
+            "--allowed-host",
+            "node-01.tail6ba6bf.ts.net",
+            "--allowed-host",
+            "extra.example",
+        ]
+    )
+
+    assert args.allowed_hosts == ["node-01.tail6ba6bf.ts.net", "extra.example"]
+
+
 
 
 

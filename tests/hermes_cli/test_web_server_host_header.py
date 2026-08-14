@@ -47,6 +47,15 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_explicit_alias_is_accepted_but_arbitrary_host_is_rejected(self):
+        from hermes_cli.web_server import _is_accepted_host
+
+        aliases = frozenset({"node-01.tail6ba6bf.ts.net"})
+        assert _is_accepted_host(
+            "node-01.tail6ba6bf.ts.net:443", "100.81.246.101", aliases
+        )
+        assert not _is_accepted_host("evil.example", "100.81.246.101", aliases)
+
 
 
 class TestHostHeaderMiddleware:
