@@ -307,6 +307,11 @@ class TestDispatchersTriggerPluginDiscovery:
             monkeypatch.setattr(
                 web_tools, "_ensure_web_plugins_loaded", mock_hook
             )
+            def _backend_after_discovery():
+                assert mock_hook.called
+                return "firecrawl"
+
+            monkeypatch.setattr(web_tools, "_get_extract_backend", _backend_after_discovery)
             monkeypatch.setattr(
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},

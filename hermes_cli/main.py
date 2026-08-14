@@ -10435,6 +10435,8 @@ def cmd_dashboard(args):
             "--host", args.host,
             "--open-profile", _launch_profile,
         ]
+        for _allowed_host in getattr(args, "allowed_hosts", []):
+            reexec_argv.extend(["--allowed-host", _allowed_host])
         if _ssh_owner_nonce:
             reexec_argv.extend(["--ssh-owner-nonce", _ssh_owner_nonce])
         if _token_file:
@@ -10643,6 +10645,7 @@ def cmd_dashboard(args):
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
+        allowed_hosts=getattr(args, "allowed_hosts", []),
         initial_profile=getattr(args, "open_profile", "") or "",
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
