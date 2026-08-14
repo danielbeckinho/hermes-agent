@@ -15,9 +15,11 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
+  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
+  onDataHandler: ((data: string) => void) | null = null;
   parser = {
     registerOscHandler: vi.fn(),
   };
@@ -25,6 +27,7 @@ class FakeTerminal {
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
+    FakeTerminal.instances.push(this);
   }
 
   attachCustomKeyEventHandler() {
@@ -47,7 +50,8 @@ class FakeTerminal {
 
   loadAddon() {}
 
-  onData() {
+  onData(handler: (data: string) => void) {
+    this.onDataHandler = handler;
     return { dispose() {} };
   }
 
@@ -82,9 +86,9 @@ vi.mock("@/components/ChatSidebar", () => ({
     return null;
   },
 }));
-const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string) => void) | null } }));
+const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string, autoSend: boolean) => void) | null } }));
 vi.mock("@/components/PushToTalkButton", () => ({
-  PushToTalkButton: (props: { onTranscript: (text: string) => void }) => {
+  PushToTalkButton: (props: { onTranscript: (text: string, autoSend: boolean) => void }) => {
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
@@ -177,6 +181,7 @@ beforeEach(() => {
     clone() { return this; },
   })));
   vi.stubGlobal("Audio", class { play() { return Promise.resolve(); } });
+  FakeTerminal.instances = [];
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -242,7 +247,7 @@ describe("ChatPage", () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
     await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt");
+    voiceState.onTranscript?.("voice prompt", true);
     sidebarState.current.onMessageStart?.({ voice_turn: false });
     sidebarState.current.onMessageComplete?.({ text: "unrelated reply", voice_turn: false });
     await Promise.resolve();
@@ -256,13 +261,91 @@ describe("ChatPage", () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
     await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt");
+    voiceState.onTranscript?.("voice prompt", true);
     sidebarState.current.onMessageStart?.({ voice_turn: true });
     sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
     await vi.waitFor(() => expect(apiMocks.fetchJSON).toHaveBeenCalledWith(
       expect.stringContaining("/api/audio/speak"),
       expect.anything(),
     ));
+  });
+
+  it("keeps a manual transcript editable until its later Enter submits the marker", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    await act(async () => ws.onopen?.());
+
+    voiceState.onTranscript?.("editable voice", false);
+    expect(ws.sent.slice(-1)).toEqual(["editable voice"]);
+    expect(ws.sent).not.toContain("\uE000");
+
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(ws.sent.slice(-2)).toEqual(["\uE000", "\r"]);
+  });
+
+  it("does not carry a manual voice marker into a newer transcript", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    await act(async () => ws.onopen?.());
+
+    voiceState.onTranscript?.("old manual", false);
+    voiceState.onTranscript?.("new auto", true);
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(ws.sent.slice(-3)).toEqual(["new auto\uE000", "\r", "\r"]);
+  });
+
+  it("cancels manual voice draft on Ctrl-U, unrelated Enter has no marker", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    await act(async () => ws.onopen?.());
+
+    voiceState.onTranscript?.("manual transcript", false);
+    expect(ws.sent.slice(-1)).toEqual(["manual transcript"]);
+
+    // Ctrl-U cancels the line
+    await act(async () => terminal.onDataHandler?.("\x15"));
+
+    // Unrelated typed text
+    await act(async () => terminal.onDataHandler?.("typed text"));
+
+    // Enter submits \u2014 should have NO voice marker
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(ws.sent).not.toContain("\uE000");
+  });
+
+  it("cancels manual voice draft on Ctrl-C, unrelated Enter has no marker", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    await act(async () => ws.onopen?.());
+
+    voiceState.onTranscript?.("manual transcript", false);
+    expect(ws.sent.slice(-1)).toEqual(["manual transcript"]);
+
+    // Ctrl-C cancels the line
+    await act(async () => terminal.onDataHandler?.("\x03"));
+
+    // Unrelated typed text
+    await act(async () => terminal.onDataHandler?.("typed text"));
+
+    // Enter submits \u2014 should have NO voice marker
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(ws.sent).not.toContain("\uE000");
   });
 
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {

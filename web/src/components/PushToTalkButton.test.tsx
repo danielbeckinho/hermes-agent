@@ -29,6 +29,25 @@ class FakeRecorder {
   stop() { this.state = "inactive"; this.onstop?.(); }
   emit(blob: Blob) { this.ondataavailable?.({ data: blob }); }
 }
+class FakeAudioContext {
+  static instances: FakeAudioContext[] = [];
+  currentTime = 0;
+  close = vi.fn();
+  createGain = vi.fn(() => ({
+    connect: vi.fn(),
+    gain: { setValueAtTime: vi.fn() },
+  }));
+  createOscillator = vi.fn(() => ({
+    connect: vi.fn(),
+    frequency: { setValueAtTime: vi.fn() },
+    onended: null as (() => void) | null,
+    start: vi.fn(),
+    stop: vi.fn(),
+    type: "sine",
+  }));
+  destination = {};
+  constructor() { FakeAudioContext.instances.push(this); }
+}
 
 let root: Root;
 let container: HTMLDivElement;
@@ -37,9 +56,24 @@ let getUserMedia: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   fetchJSON.mockReset();
   fetchJSON.mockResolvedValue({ transcript: "voice input" });
+  // jsdom in this pool has no localStorage (about:blank document URL), so
+  // stub a minimal in-memory implementation — mirrors the try/catch
+  // defensiveness the component uses around window.localStorage.
+  const localStorageStore = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    clear: () => localStorageStore.clear(),
+    getItem: (key: string) =>
+      localStorageStore.has(key) ? localStorageStore.get(key)! : null,
+    removeItem: (key: string) => localStorageStore.delete(key),
+    setItem: (key: string, value: string) => {
+      localStorageStore.set(key, value);
+    },
+  });
   FakeRecorder.instances = [];
+  FakeAudioContext.instances = [];
   getUserMedia = vi.fn(async () => new FakeStream());
   vi.stubGlobal("MediaRecorder", FakeRecorder);
+  vi.stubGlobal("AudioContext", FakeAudioContext);
   HTMLElement.prototype.setPointerCapture = vi.fn();
   Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
   vi.stubGlobal("FileReader", class {
@@ -71,13 +105,51 @@ async function startRecording(expected = 1) {
 }
 
 describe("PushToTalkButton", () => {
+  it("shows requesting synchronously, then records with one start cue", async () => {
+    let resolve: (stream: FakeStream) => void = () => {};
+    getUserMedia.mockReturnValue(new Promise<FakeStream>((r) => { resolve = r; }));
+    await render();
+
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
+    expect(button().getAttribute("aria-label")).toBe("Requesting microphone");
+    expect(button().textContent).toContain("requesting");
+    expect(FakeAudioContext.instances).toHaveLength(0);
+
+    await act(async () => resolve(new FakeStream()));
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    expect(button().getAttribute("aria-label")).toBe("Recording. Release to send");
+    expect(FakeAudioContext.instances).toHaveLength(1);
+  });
+
+  it("plays one stop cue only after recording starts", async () => {
+    await render();
+    await startRecording();
+    await act(async () => button().dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 })));
+    expect(FakeAudioContext.instances).toHaveLength(2);
+
+    let resolve: (stream: FakeStream) => void = () => {};
+    getUserMedia.mockReturnValue(new Promise<FakeStream>((r) => { resolve = r; }));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await act(async () => resolve(new FakeStream()));
+    expect(FakeAudioContext.instances).toHaveLength(2);
+  });
+
+  it("plays one stop cue when pointer capture is lost", async () => {
+    await render();
+    await startRecording();
+    await act(async () => button().dispatchEvent(new Event("lostpointercapture", { bubbles: true })));
+    expect(FakeAudioContext.instances).toHaveLength(2);
+  });
+
   it("starts on pointer hold and submits one transcript on release", async () => {
     const onTranscript = await render();
     await startRecording();
     const recorder = FakeRecorder.instances[0];
     recorder.emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input"));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
+    expect(FakeAudioContext.instances).toHaveLength(2);
     expect(recorder.stream.track.stop).toHaveBeenCalled();
   });
 
@@ -87,6 +159,7 @@ describe("PushToTalkButton", () => {
     const onTranscript = await render();
     await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    expect(button().getAttribute("aria-label")).toBe("Hold to talk");
     await act(async () => resolve(new FakeStream()));
     expect(FakeRecorder.instances).toHaveLength(0);
     expect(onTranscript).not.toHaveBeenCalled();
@@ -97,6 +170,7 @@ describe("PushToTalkButton", () => {
     await render();
     await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
     await vi.waitFor(() => expect(getUserMedia).toHaveBeenCalled());
+    expect(FakeAudioContext.instances).toHaveLength(0);
   });
 
   it("cleans up when recorder construction fails", async () => {
@@ -138,6 +212,33 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
     FakeRecorder.instances[0].emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new KeyboardEvent("keyup", { key: " ", bubbles: true })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input"));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
+  });
+
+  function autoSendToggle() {
+    return container.querySelector(
+      'input[aria-label="Auto-send voice transcript"]',
+    ) as HTMLInputElement | null;
+  }
+
+  it("defaults the auto-send toggle to checked when no preference is stored", async () => {
+    await render();
+    expect(autoSendToggle()?.checked).toBe(true);
+  });
+
+  it("loads a stored manual preference as unchecked on mount", async () => {
+    window.localStorage.setItem("hermes.voice.autoSend", "0");
+    await render();
+    expect(autoSendToggle()?.checked).toBe(false);
+  });
+
+  it("persists a toggle change and passes it on the next transcript", async () => {
+    const onTranscript = await render();
+    await act(async () => autoSendToggle()?.click());
+    expect(window.localStorage.getItem("hermes.voice.autoSend")).toBe("0");
+    await startRecording();
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", false));
   });
 });

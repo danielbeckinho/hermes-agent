@@ -168,6 +168,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
+  // Set when a manual (auto-send off) voice capture wrote its transcript into
+  // the PTY input line without submitting. Consumed by the onData handler
+  // below: the private voice marker is injected immediately before the
+  // user's later Enter, then the ref clears. Never set for typed input, so
+  // an unrelated Enter press never inherits the marker.
+  const manualVoiceDraftPendingRef = useRef(false);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -472,14 +478,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     termRef.current?.focus();
   };
 
-  const handleVoiceTranscript = useCallback((transcript: string) => {
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Private-use Unicode suffix is consumed by ui-tui before prompt.submit;
-    // ordinary typed input never carries this suffix.
-    pendingVoiceTurnRef.current = "awaiting-start";
-    ws.send(`${transcript}\uE000`);
-    ws.send("\r");
+    // A newer capture always discards any prior unsubmitted manual draft's
+    // correlation, whether this capture is itself auto or manual.
+    manualVoiceDraftPendingRef.current = false;
+    if (autoSend) {
+      // Private-use Unicode suffix is consumed by ui-tui before prompt.submit;
+      // ordinary typed input never carries this suffix.
+      pendingVoiceTurnRef.current = "awaiting-start";
+      ws.send(`${transcript}\uE000`);
+      ws.send("\r");
+      return;
+    }
+    // Manual mode: drop the plain transcript into the PTY input line only.
+    // No marker, no Enter \u2014 stays editable until the user submits it
+    // themselves via the onData handler below.
+    pendingVoiceTurnRef.current = "idle";
+    manualVoiceDraftPendingRef.current = true;
+    ws.send(transcript);
   }, []);
 
   const handleVoiceStart = useCallback((payload: unknown) => {
@@ -519,6 +537,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
   useEffect(() => () => {
     pendingVoiceTurnRef.current = "idle";
+    manualVoiceDraftPendingRef.current = false;
   }, [channel, reconnectNonce, scopedProfile]);
 
   useEffect(() => {
@@ -1263,6 +1282,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         ptyInputLineRef.current = normalized.nextLine;
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0;
+        }
+        // Terminal line-cancel controls (Ctrl-U, Ctrl-C) discard the input
+        // line, so cancel any pending manual voice draft.
+        if (normalized.data.includes("\x15") || normalized.data.includes("\x03")) {
+          manualVoiceDraftPendingRef.current = false;
+        }
+        // A pending manual voice draft only gets the private marker once the
+        // user actually submits (Enter) — this is the existing xterm/PTY
+        // submission seam. Consumed once; typed/unrelated Enters with no
+        // pending draft never carry the marker.
+        if (
+          manualVoiceDraftPendingRef.current &&
+          (normalized.data.includes("\r") || normalized.data.includes("\n"))
+        ) {
+          manualVoiceDraftPendingRef.current = false;
+          pendingVoiceTurnRef.current = "awaiting-start";
+          ws.send("");
         }
         ws.send(normalized.data);
       });

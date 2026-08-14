@@ -5,8 +5,29 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { fetchJSON } from "@/lib/api";
 
 interface PushToTalkButtonProps {
-  onTranscript: (transcript: string) => void;
+  onTranscript: (transcript: string, autoSend: boolean) => void;
   profile?: string;
+}
+
+// Per-browser preference: whether a captured transcript is sent immediately
+// (auto) or only dropped into the PTY input line for the user to edit and
+// submit themselves (manual). Absent (never toggled, or storage blocked)
+// means auto-send stays on.
+const AUTO_SEND_KEY = "hermes.voice.autoSend";
+function readAutoSend(): boolean {
+  try {
+    const v = window.localStorage.getItem(AUTO_SEND_KEY);
+    return v === null ? true : v === "1";
+  } catch {
+    return true;
+  }
+}
+function writeAutoSend(value: boolean): void {
+  try {
+    window.localStorage.setItem(AUTO_SEND_KEY, value ? "1" : "0");
+  } catch {
+    /* private mode / storage blocked */
+  }
 }
 
 function stopTracks(stream: MediaStream | null): void {
@@ -22,6 +43,23 @@ function dataUrl(blob: Blob): Promise<string> {
   });
 }
 
+function playCue(frequency: number): void {
+  try {
+    const context = new AudioContext();
+    const gain = context.createGain();
+    const oscillator = context.createOscillator();
+    gain.gain.setValueAtTime(0.025, context.currentTime);
+    oscillator.frequency.setValueAtTime(frequency, context.currentTime);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.onended = () => void context.close();
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.06);
+  } catch {
+    // Audio cues are optional feedback; recording must still work without Web Audio.
+  }
+}
+
 export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -29,13 +67,22 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const holdingRef = useRef(false);
   const disposedRef = useRef(false);
   const recordingRef = useRef(false);
-  const [recording, setRecording] = useState(false);
+  const [state, setState] = useState<"idle" | "requesting" | "recording">("idle");
+  const [autoSend, setAutoSend] = useState(() => readAutoSend());
+  const autoSendRef = useRef(autoSend);
+  useEffect(() => {
+    autoSendRef.current = autoSend;
+  }, [autoSend]);
 
   const release = useCallback(() => {
     holdingRef.current = false;
-    if (!recordingRef.current) return;
+    if (!recordingRef.current) {
+      setState("idle");
+      return;
+    }
     recordingRef.current = false;
-    setRecording(false);
+    setState("idle");
+    playCue(440);
     recorderRef.current?.stop();
   }, []);
 
@@ -43,6 +90,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     if (requestingRef.current || recordingRef.current) return;
     holdingRef.current = true;
     requestingRef.current = true;
+    setState("requesting");
     let stream: MediaStream | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -75,15 +123,17 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
           ))
           .then((response) => {
             const transcript = response.transcript?.trim();
-            if (transcript) onTranscript(transcript);
+            if (transcript) onTranscript(transcript, autoSendRef.current);
           })
           .catch(() => {});
       };
       recorder.start();
       recordingRef.current = true;
-      setRecording(true);
+      setState("recording");
+      playCue(660);
     } catch {
       stopTracks(stream);
+      setState("idle");
     } finally {
       requestingRef.current = false;
     }
@@ -92,6 +142,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   useEffect(() => () => {
     disposedRef.current = true;
     holdingRef.current = false;
+    if (recordingRef.current) playCue(440);
     recordingRef.current = false;
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
     stopTracks(streamRef.current);
@@ -100,34 +151,50 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   }, []);
 
   return (
-    <Button
-      type="button"
-      aria-label="Hold to talk"
-      aria-pressed={recording}
-      className="absolute bottom-2 left-2 z-10 rounded border border-current/30 bg-black/20 px-2 py-1 text-xs opacity-80 hover:opacity-100 sm:bottom-3 sm:left-3"
-      onKeyDown={(event) => {
-        if (event.key === " " || event.key === "Enter") {
+    <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 sm:bottom-3 sm:left-3">
+      <Button
+        type="button"
+        aria-label={state === "requesting" ? "Requesting microphone" : state === "recording" ? "Recording. Release to send" : "Hold to talk"}
+        aria-pressed={state === "recording"}
+        aria-busy={state === "requesting"}
+        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${state === "recording" ? "border-red-400 bg-red-950" : state === "requesting" ? "border-yellow-300 bg-yellow-950" : "border-white/70 bg-black"}`}
+        onKeyDown={(event) => {
+          if (event.key === " " || event.key === "Enter") {
+            event.preventDefault();
+            void start();
+          }
+        }}
+        onKeyUp={(event) => {
+          if (event.key === " " || event.key === "Enter") {
+            event.preventDefault();
+            release();
+          }
+        }}
+        onPointerCancel={release}
+        onPointerDown={(event) => {
           event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
           void start();
-        }
-      }}
-      onKeyUp={(event) => {
-        if (event.key === " " || event.key === "Enter") {
-          event.preventDefault();
-          release();
-        }
-      }}
-      onPointerCancel={release}
-      onPointerDown={(event) => {
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        void start();
-      }}
-      onLostPointerCapture={release}
-      onPointerUp={release}
-    >
-      <Mic className="size-3" />
-      <span className="ml-1">{recording ? "recording" : "hold to talk"}</span>
-    </Button>
+        }}
+        onLostPointerCapture={release}
+        onPointerUp={release}
+      >
+        <Mic className="size-3" />
+        <span className="ml-1">{state === "idle" ? "hold to talk" : state}</span>
+      </Button>
+      <label className="flex items-center gap-1 rounded border border-current/30 bg-black/20 px-2 py-1 text-xs opacity-80 hover:opacity-100">
+        <input
+          type="checkbox"
+          checked={autoSend}
+          onChange={(event) => {
+            const next = event.target.checked;
+            writeAutoSend(next);
+            setAutoSend(next);
+          }}
+          aria-label="Auto-send voice transcript"
+        />
+        auto-send
+      </label>
+    </div>
   );
 }
