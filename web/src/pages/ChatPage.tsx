@@ -32,9 +32,10 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { PushToTalkButton } from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, fetchJSON } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
@@ -166,6 +167,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const pendingVoiceTurnRef = useRef(false);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -469,6 +471,37 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
+
+  const handleVoiceTranscript = useCallback((transcript: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    pendingVoiceTurnRef.current = true;
+    ws.send(transcript);
+    ws.send("\r");
+  }, []);
+
+  const handleVoiceCompletion = useCallback((payload: unknown) => {
+    if (!pendingVoiceTurnRef.current) return;
+    pendingVoiceTurnRef.current = false;
+    const text = typeof payload === "object" && payload !== null
+      ? String((payload as { text?: unknown }).text ?? "").trim()
+      : "";
+    if (!text) return;
+    void fetchJSON<{ data_url?: string }>(
+      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
+      {
+        body: JSON.stringify({ text }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ).then((response) => {
+      if (response.data_url) void new Audio(response.data_url).play().catch(() => {});
+    }).catch(() => {});
+  }, [scopedProfile]);
+
+  useEffect(() => () => {
+    pendingVoiceTurnRef.current = false;
+  }, [channel, reconnectNonce, scopedProfile]);
 
   useEffect(() => {
     // Don't spawn the chat PTY (and the TUI/agent bootstrap it triggers)
@@ -1482,6 +1515,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
@@ -1523,6 +1557,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+          <PushToTalkButton onTranscript={handleVoiceTranscript} profile={scopedProfile} />
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1615,6 +1650,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>

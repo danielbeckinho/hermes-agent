@@ -90,6 +90,7 @@ interface ChatSidebarProps {
   profile?: string;
   className?: string;
   onDashboardNewSessionRequest?: () => void;
+  onMessageComplete?: (payload: unknown) => void;
   onSessionTitleChange?: (title: string | null) => void;
 }
 
@@ -113,6 +114,7 @@ export function ChatSidebar({
   profile,
   className,
   onDashboardNewSessionRequest,
+  onMessageComplete,
   onSessionTitleChange,
 }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
@@ -364,6 +366,8 @@ export function ChatSidebar({
           if (title !== undefined) {
             onSessionTitleChange?.(title);
           }
+        } else if (type === "message.complete") {
+          onMessageComplete?.(payload);
         } else if (type === "dashboard.new_session_requested") {
           onDashboardNewSessionRequest?.();
         }
@@ -380,7 +384,7 @@ export function ChatSidebar({
       }
       ws?.close();
     };
-  }, [channel, onDashboardNewSessionRequest, onSessionTitleChange, version]);
+  }, [channel, onDashboardNewSessionRequest, onMessageComplete, onSessionTitleChange, version]);
 
   // Seed the badge on mount and re-read it whenever the sockets are rebuilt
   // (a profile/channel switch bumps `version`).
