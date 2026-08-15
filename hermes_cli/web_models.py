@@ -32,6 +32,12 @@ class EnvVarUpdate(BaseModel):
     api_key: str = ""
 
 
+class TranscriptAutosaveAppend(BaseModel):
+    path: str
+    text: str
+    profile: Optional[str] = None
+
+
 class EnvVarDelete(BaseModel):
     key: str
     profile: Optional[str] = None

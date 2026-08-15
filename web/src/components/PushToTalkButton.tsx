@@ -5,8 +5,13 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { fetchJSON } from "@/lib/api";
 
 interface PushToTalkButtonProps {
-  onTranscript: (transcript: string, autoSend: boolean) => void;
+  onTranscript: (transcript: string, autoSend: boolean, autosave: TranscriptAutosaveSettings) => void;
   profile?: string;
+}
+
+export interface TranscriptAutosaveSettings {
+  enabled: boolean;
+  path: string;
 }
 
 // Per-browser preference: whether a captured transcript is sent immediately
@@ -14,6 +19,8 @@ interface PushToTalkButtonProps {
 // submit themselves (manual). Absent (never toggled, or storage blocked)
 // means auto-send stays on.
 const AUTO_SEND_KEY = "hermes.voice.autoSend";
+export const TRANSCRIPT_AUTOSAVE_ENABLED_KEY = "hermes.transcriptAutosave.enabled";
+export const TRANSCRIPT_AUTOSAVE_PATH_KEY = "hermes.transcriptAutosave.path";
 function readAutoSend(): boolean {
   try {
     const v = window.localStorage.getItem(AUTO_SEND_KEY);
@@ -27,6 +34,26 @@ function writeAutoSend(value: boolean): void {
     window.localStorage.setItem(AUTO_SEND_KEY, value ? "1" : "0");
   } catch {
     /* private mode / storage blocked */
+  }
+}
+
+function writeTranscriptAutosaveSettings(settings: TranscriptAutosaveSettings): void {
+  try {
+    window.localStorage.setItem(TRANSCRIPT_AUTOSAVE_ENABLED_KEY, settings.enabled ? "1" : "0");
+    window.localStorage.setItem(TRANSCRIPT_AUTOSAVE_PATH_KEY, settings.path);
+  } catch {
+    /* private mode / storage blocked */
+  }
+}
+
+export function readTranscriptAutosaveSettings(): TranscriptAutosaveSettings {
+  try {
+    return {
+      enabled: window.localStorage.getItem(TRANSCRIPT_AUTOSAVE_ENABLED_KEY) === "1",
+      path: window.localStorage.getItem(TRANSCRIPT_AUTOSAVE_PATH_KEY) || "transcript.txt",
+    };
+  } catch {
+    return { enabled: false, path: "transcript.txt" };
   }
 }
 
@@ -67,8 +94,10 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const holdingRef = useRef(false);
   const disposedRef = useRef(false);
   const recordingRef = useRef(false);
+  const pageDownHeldRef = useRef(false);
   const [state, setState] = useState<"idle" | "requesting" | "recording">("idle");
   const [autoSend, setAutoSend] = useState(() => readAutoSend());
+  const [autosave, setAutosave] = useState(() => readTranscriptAutosaveSettings());
   const autoSendRef = useRef(autoSend);
   useEffect(() => {
     autoSendRef.current = autoSend;
@@ -123,7 +152,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
           ))
           .then((response) => {
             const transcript = response.transcript?.trim();
-            if (transcript) onTranscript(transcript, autoSendRef.current);
+            if (transcript) onTranscript(transcript, autoSendRef.current, autosave);
           })
           .catch(() => {});
       };
@@ -137,11 +166,41 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     } finally {
       requestingRef.current = false;
     }
-  }, [onTranscript, profile]);
+  }, [autosave, onTranscript, profile]);
+
+  useEffect(() => {
+    const isEditable = (target: EventTarget | null): boolean =>
+      !(target instanceof HTMLTextAreaElement && target.classList.contains("xterm-helper-textarea"))
+      && target instanceof Element
+      && Boolean(target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])"));
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "PageDown" || isEditable(event.target)) return;
+      if (pageDownHeldRef.current) {
+        event.preventDefault();
+        return;
+      }
+      pageDownHeldRef.current = true;
+      event.preventDefault();
+      void start();
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key !== "PageDown" || !pageDownHeldRef.current) return;
+      pageDownHeldRef.current = false;
+      event.preventDefault();
+      release();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+    };
+  }, [release, start]);
 
   useEffect(() => () => {
     disposedRef.current = true;
     holdingRef.current = false;
+    pageDownHeldRef.current = false;
     if (recordingRef.current) playCue(440);
     recordingRef.current = false;
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
@@ -195,6 +254,30 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
         />
         auto-send
       </label>
+      <label className="flex items-center gap-1 rounded border border-current/30 bg-black/20 px-2 py-1 text-xs opacity-80 hover:opacity-100">
+        <input
+          type="checkbox"
+          checked={autosave.enabled}
+          onChange={(event) => {
+            const next = { ...autosave, enabled: event.target.checked };
+            writeTranscriptAutosaveSettings(next);
+            setAutosave(next);
+          }}
+          aria-label="Save sent prompts"
+        />
+        save prompts
+      </label>
+      <input
+        className="w-28 rounded border border-current/30 bg-black/20 px-1 py-1 text-xs"
+        aria-label="Transcript output path"
+        value={autosave.path}
+        onChange={(event) => {
+          const next = { ...autosave, path: event.target.value };
+          writeTranscriptAutosaveSettings(next);
+          setAutosave(next);
+        }}
+        placeholder="transcript.txt"
+      />
     </div>
   );
 }
