@@ -484,8 +484,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
   const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
     if (!settings.enabled || !settings.path.trim() || !text.trim()) return;
+    const savedText = settings.timestamp
+      ? text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n")
+      : text;
     void fetchJSON("/api/dashboard/transcript-autosave", {
-      body: JSON.stringify({ path: settings.path, text: settings.timestamp ? `${new Date().toISOString()} ${text}` : text }),
+      body: JSON.stringify({ path: settings.path, text: savedText }),
       headers: { "Content-Type": "application/json" },
       method: "POST",
     }).catch(() => {});

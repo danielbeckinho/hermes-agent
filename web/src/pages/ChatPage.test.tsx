@@ -274,6 +274,21 @@ describe("ChatPage", () => {
     vi.useRealTimers();
   });
 
+  it("timestamps every non-empty line in an explicit multiline send-and-save entry", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T22:00:00.000Z"));
+
+    voiceState.onTranscript?.("first line\n\nsecond line", true, { enabled: true, path: "transcript.txt", timestamp: true });
+
+    expect(apiMocks.fetchJSON).toHaveBeenCalledWith("/api/dashboard/transcript-autosave", expect.objectContaining({
+      body: JSON.stringify({ path: "transcript.txt", text: "2026-08-15T22:00:00.000Z first line\n2026-08-15T22:00:00.000Z second line" }),
+    }));
+    vi.useRealTimers();
+  });
+
   it("does not speak an unrelated turn after a voice transcript", async () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
