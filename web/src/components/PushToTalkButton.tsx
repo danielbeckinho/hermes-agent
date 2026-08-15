@@ -95,7 +95,9 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const holdingRef = useRef(false);
   const disposedRef = useRef(false);
   const recordingRef = useRef(false);
-  const [state, setState] = useState<"idle" | "requesting" | "recording">("idle");
+  const pageUpHeldRef = useRef(false);
+  const pageDownHeldRef = useRef(false);
+  const [state, setState] = useState<"idle" | "requesting" | "recording" | "error">("idle");
   const [autoSend, setAutoSend] = useState(() => readAutoSend());
   const [autosave, setAutosave] = useState(() => readTranscriptAutosaveSettings());
   const autoSendRef = useRef(autoSend);
@@ -106,7 +108,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const release = useCallback(() => {
     holdingRef.current = false;
     if (!recordingRef.current) {
-      setState("idle");
+      setState((prev) => (prev === "error" ? prev : "idle"));
       return;
     }
     recordingRef.current = false;
@@ -115,7 +117,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     recorderRef.current?.stop();
   }, []);
 
-  const start = useCallback(async (options?: { autoSend: boolean; autosave: TranscriptAutosaveSettings }) => {
+  const start = useCallback(async (options?: { autoSend?: boolean; autosave?: TranscriptAutosaveSettings }) => {
     if (requestingRef.current || recordingRef.current) return;
     holdingRef.current = true;
     requestingRef.current = true;
@@ -162,15 +164,61 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
       playCue(660);
     } catch {
       stopTracks(stream);
-      setState("idle");
+      setState("error");
     } finally {
       requestingRef.current = false;
     }
   }, [autosave, onTranscript, profile]);
 
+  useEffect(() => {
+    const isEditable = (target: EventTarget | null): boolean =>
+      !(target instanceof HTMLTextAreaElement && target.classList.contains("xterm-helper-textarea"))
+      && target instanceof Element
+      && Boolean(target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])"));
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditable(event.target)) return;
+      if (event.key === "PageUp") {
+        if (pageUpHeldRef.current) {
+          event.preventDefault();
+          return;
+        }
+        pageUpHeldRef.current = true;
+        event.preventDefault();
+        void start();
+      } else if (event.key === "PageDown" && autosave.enabled) {
+        if (pageDownHeldRef.current) {
+          event.preventDefault();
+          return;
+        }
+        pageDownHeldRef.current = true;
+        event.preventDefault();
+        void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "PageUp" && pageUpHeldRef.current) {
+        pageUpHeldRef.current = false;
+        event.preventDefault();
+        release();
+      } else if (event.key === "PageDown" && pageDownHeldRef.current) {
+        pageDownHeldRef.current = false;
+        event.preventDefault();
+        release();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+    };
+  }, [autosave, release, start]);
+
   useEffect(() => () => {
     disposedRef.current = true;
     holdingRef.current = false;
+    pageUpHeldRef.current = false;
+    pageDownHeldRef.current = false;
     if (recordingRef.current) playCue(440);
     recordingRef.current = false;
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
@@ -183,18 +231,23 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 sm:bottom-3 sm:left-3">
       <Button
         type="button"
-        aria-label={state === "requesting" ? "Requesting microphone" : state === "recording" ? "Recording. Release to send" : "Hold to talk"}
+        aria-label={
+          state === "requesting" ? "Requesting microphone"
+          : state === "recording" ? "Recording. Release to send"
+          : state === "error" ? "Microphone error. Press to retry"
+          : "Send (PgUp)"
+        }
         aria-pressed={state === "recording"}
         aria-busy={state === "requesting"}
-        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${state === "recording" ? "border-red-400 bg-red-950" : state === "requesting" ? "border-yellow-300 bg-yellow-950" : "border-white/70 bg-black"}`}
+        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${state === "recording" ? "border-red-400 bg-red-950" : state === "requesting" ? "border-yellow-300 bg-yellow-950" : state === "error" ? "border-orange-400 bg-orange-950" : "border-white/70 bg-black"}`}
         onKeyDown={(event) => {
-          if (event.key === " " || event.key === "Enter") {
+          if (event.key === "PageUp") {
             event.preventDefault();
             void start();
           }
         }}
         onKeyUp={(event) => {
-          if (event.key === " " || event.key === "Enter") {
+          if (event.key === "PageUp") {
             event.preventDefault();
             release();
           }
@@ -209,43 +262,17 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
         onPointerUp={release}
       >
         <Mic className="size-3" />
-        <span className="ml-1">{state === "idle" ? "hold to talk" : state}</span>
-      </Button>
-      <Button
-        type="button"
-        aria-label="Send (PgUp)"
-        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white"
-        onKeyDown={(event) => {
-          if (event.key === "PageUp") {
-            event.preventDefault();
-            void start({ autoSend: true, autosave: { ...autosave, enabled: false } });
-          }
-        }}
-        onKeyUp={(event) => {
-          if (event.key === "PageUp") {
-            event.preventDefault();
-            release();
-          }
-        }}
-        onPointerCancel={release}
-        onPointerDown={(event) => {
-          event.preventDefault();
-          event.currentTarget.setPointerCapture(event.pointerId);
-          void start({ autoSend: true, autosave: { ...autosave, enabled: false } });
-        }}
-        onLostPointerCapture={release}
-        onPointerUp={release}
-      >
-        Send (PgUp)
+        <span className="ml-1">{state === "idle" ? "Send (PgUp)" : state === "error" ? "retry" : state}</span>
       </Button>
       <Button
         type="button"
         aria-label="Send + Save (PgDown)"
-        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white"
+        disabled={!autosave.enabled}
+        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-40"
         onKeyDown={(event) => {
-          if (event.key === "PageDown") {
+          if (event.key === "PageDown" && autosave.enabled) {
             event.preventDefault();
-            void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
+            void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
           }
         }}
         onKeyUp={(event) => {
@@ -256,9 +283,10 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
         }}
         onPointerCancel={release}
         onPointerDown={(event) => {
+          if (!autosave.enabled) return;
           event.preventDefault();
           event.currentTarget.setPointerCapture(event.pointerId);
-          void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
+          void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
         }}
         onLostPointerCapture={release}
         onPointerUp={release}
