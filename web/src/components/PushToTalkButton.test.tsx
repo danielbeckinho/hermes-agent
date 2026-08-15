@@ -153,6 +153,30 @@ describe("PushToTalkButton", () => {
     expect(recorder.stream.track.stop).toHaveBeenCalled();
   });
 
+  it("sends a held transcript without autosaving", async () => {
+    const onTranscript = await render();
+    const send = container.querySelector('button[aria-label="Send (PgUp)"]') as HTMLButtonElement;
+    await act(async () => send.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => send.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
+  });
+
+  it("sends and timestamps a held transcript when saving", async () => {
+    const onTranscript = await render();
+    const sendAndSave = container.querySelector('button[aria-label="Send + Save (PgDown)"]') as HTMLButtonElement;
+    await act(async () => sendAndSave.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => sendAndSave.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, {
+      enabled: true,
+      path: "transcript.txt",
+      timestamp: true,
+    }));
+  });
+
   it("does not construct a recorder when released before permission resolves", async () => {
     let resolve: (stream: FakeStream) => void = () => {};
     getUserMedia.mockReturnValue(new Promise<FakeStream>((r) => { resolve = r; }));
@@ -215,60 +239,38 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
   });
 
-  it("supports PageDown hold-to-talk without duplicate recorders", async () => {
+  it("sends and saves when PageDown is held on its control", async () => {
     const onTranscript = await render();
-    const down = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
-    const repeat = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true, repeat: true });
-    await act(async () => {
-      expect(window.dispatchEvent(down)).toBe(false);
-      window.dispatchEvent(repeat);
-    });
+    const sendAndSave = container.querySelector('button[aria-label="Send + Save (PgDown)"]') as HTMLButtonElement;
+    await act(async () => sendAndSave.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true })));
     await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
-    expect(getUserMedia).toHaveBeenCalledTimes(1);
     FakeRecorder.instances[0].emit(new Blob(["audio"]));
-    await act(async () => {
-      expect(window.dispatchEvent(new KeyboardEvent("keyup", { key: "PageDown", bubbles: true, cancelable: true }))).toBe(false);
-    });
+    await act(async () => sendAndSave.dispatchEvent(new KeyboardEvent("keyup", { key: "PageDown", bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, {
+      enabled: true,
+      path: "transcript.txt",
+      timestamp: true,
+    }));
+  });
+
+  it("sends without saving when PageUp is held on its control", async () => {
+    const onTranscript = await render();
+    const send = container.querySelector('button[aria-label="Send (PgUp)"]') as HTMLButtonElement;
+    await act(async () => send.dispatchEvent(new KeyboardEvent("keydown", { key: "PageUp", bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => send.dispatchEvent(new KeyboardEvent("keyup", { key: "PageUp", bubbles: true, cancelable: true })));
     await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
   });
 
-  it("ignores PageDown from editable controls without preventing default", async () => {
+  it("does not capture PageUp or PageDown globally", async () => {
     await render();
-    const controls = ["input", "textarea", "select"].map((tag) => document.createElement(tag));
-    const contenteditable = document.createElement("div");
-    contenteditable.setAttribute("contenteditable", "true");
-    controls.push(contenteditable);
-    for (const control of controls) {
-      document.body.append(control);
-      const event = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
-      await act(async () => control.dispatchEvent(event));
+    for (const key of ["PageUp", "PageDown"]) {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      await act(async () => window.dispatchEvent(event));
       expect(event.defaultPrevented).toBe(false);
-      control.remove();
     }
     expect(FakeRecorder.instances).toHaveLength(0);
-  });
-
-  it("handles PageDown from xterm's helper textarea", async () => {
-    await render();
-    const terminalInput = document.createElement("textarea");
-    terminalInput.className = "xterm-helper-textarea";
-    terminalInput.addEventListener("keydown", (event) => event.stopPropagation());
-    document.body.append(terminalInput);
-    const down = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
-    await act(async () => expect(terminalInput.dispatchEvent(down)).toBe(false));
-    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
-    terminalInput.remove();
-  });
-
-  it("releases an active PageDown recording even when focus moves to an input", async () => {
-    await render();
-    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true })));
-    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
-    const input = document.createElement("input");
-    document.body.append(input);
-    await act(async () => input.dispatchEvent(new KeyboardEvent("keyup", { key: "PageDown", bubbles: true, cancelable: true })));
-    expect(FakeRecorder.instances[0].state).toBe("inactive");
-    input.remove();
   });
 
   function autoSendToggle() {

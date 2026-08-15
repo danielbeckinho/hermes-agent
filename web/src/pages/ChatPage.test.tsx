@@ -86,9 +86,9 @@ vi.mock("@/components/ChatSidebar", () => ({
     return null;
   },
 }));
-const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string, autoSend: boolean) => void) | null } }));
+const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void) | null } }));
 vi.mock("@/components/PushToTalkButton", () => ({
-  PushToTalkButton: (props: { onTranscript: (text: string, autoSend: boolean) => void }) => {
+  PushToTalkButton: (props: { onTranscript: (text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void }) => {
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
@@ -256,6 +256,21 @@ describe("ChatPage", () => {
 
     await vi.advanceTimersByTimeAsync(100);
     expect(ws.sent.slice(-2)).toEqual(["voice prompt\uE000", "\r"]);
+    vi.useRealTimers();
+  });
+
+  it("timestamps only an explicit voice send-and-save entry", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T22:00:00.000Z"));
+
+    voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt", timestamp: true });
+
+    expect(apiMocks.fetchJSON).toHaveBeenCalledWith("/api/dashboard/transcript-autosave", expect.objectContaining({
+      body: JSON.stringify({ path: "transcript.txt", text: "2026-08-15T22:00:00.000Z voice prompt" }),
+    }));
     vi.useRealTimers();
   });
 

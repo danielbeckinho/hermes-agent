@@ -12,6 +12,7 @@ interface PushToTalkButtonProps {
 export interface TranscriptAutosaveSettings {
   enabled: boolean;
   path: string;
+  timestamp?: boolean;
 }
 
 // Per-browser preference: whether a captured transcript is sent immediately
@@ -94,7 +95,6 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
   const holdingRef = useRef(false);
   const disposedRef = useRef(false);
   const recordingRef = useRef(false);
-  const pageDownHeldRef = useRef(false);
   const [state, setState] = useState<"idle" | "requesting" | "recording">("idle");
   const [autoSend, setAutoSend] = useState(() => readAutoSend());
   const [autosave, setAutosave] = useState(() => readTranscriptAutosaveSettings());
@@ -115,7 +115,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     recorderRef.current?.stop();
   }, []);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (options?: { autoSend: boolean; autosave: TranscriptAutosaveSettings }) => {
     if (requestingRef.current || recordingRef.current) return;
     holdingRef.current = true;
     requestingRef.current = true;
@@ -152,7 +152,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
           ))
           .then((response) => {
             const transcript = response.transcript?.trim();
-            if (transcript) onTranscript(transcript, autoSendRef.current, autosave);
+            if (transcript) onTranscript(transcript, options?.autoSend ?? autoSendRef.current, options?.autosave ?? autosave);
           })
           .catch(() => {});
       };
@@ -168,39 +168,9 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     }
   }, [autosave, onTranscript, profile]);
 
-  useEffect(() => {
-    const isEditable = (target: EventTarget | null): boolean =>
-      !(target instanceof HTMLTextAreaElement && target.classList.contains("xterm-helper-textarea"))
-      && target instanceof Element
-      && Boolean(target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])"));
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "PageDown" || isEditable(event.target)) return;
-      if (pageDownHeldRef.current) {
-        event.preventDefault();
-        return;
-      }
-      pageDownHeldRef.current = true;
-      event.preventDefault();
-      void start();
-    };
-    const onKeyUp = (event: KeyboardEvent) => {
-      if (event.key !== "PageDown" || !pageDownHeldRef.current) return;
-      pageDownHeldRef.current = false;
-      event.preventDefault();
-      release();
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    window.addEventListener("keyup", onKeyUp, true);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-      window.removeEventListener("keyup", onKeyUp, true);
-    };
-  }, [release, start]);
-
   useEffect(() => () => {
     disposedRef.current = true;
     holdingRef.current = false;
-    pageDownHeldRef.current = false;
     if (recordingRef.current) playCue(440);
     recordingRef.current = false;
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
@@ -240,6 +210,60 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
       >
         <Mic className="size-3" />
         <span className="ml-1">{state === "idle" ? "hold to talk" : state}</span>
+      </Button>
+      <Button
+        type="button"
+        aria-label="Send (PgUp)"
+        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white"
+        onKeyDown={(event) => {
+          if (event.key === "PageUp") {
+            event.preventDefault();
+            void start({ autoSend: true, autosave: { ...autosave, enabled: false } });
+          }
+        }}
+        onKeyUp={(event) => {
+          if (event.key === "PageUp") {
+            event.preventDefault();
+            release();
+          }
+        }}
+        onPointerCancel={release}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          void start({ autoSend: true, autosave: { ...autosave, enabled: false } });
+        }}
+        onLostPointerCapture={release}
+        onPointerUp={release}
+      >
+        Send (PgUp)
+      </Button>
+      <Button
+        type="button"
+        aria-label="Send + Save (PgDown)"
+        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white"
+        onKeyDown={(event) => {
+          if (event.key === "PageDown") {
+            event.preventDefault();
+            void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
+          }
+        }}
+        onKeyUp={(event) => {
+          if (event.key === "PageDown") {
+            event.preventDefault();
+            release();
+          }
+        }}
+        onPointerCancel={release}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
+        }}
+        onLostPointerCapture={release}
+        onPointerUp={release}
+      >
+        Send + Save (PgDown)
       </Button>
       <label className="flex items-center gap-1 rounded border border-current/30 bg-black/20 px-2 py-1 text-xs opacity-80 hover:opacity-100">
         <input
