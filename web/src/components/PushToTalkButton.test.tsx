@@ -148,7 +148,7 @@ describe("PushToTalkButton", () => {
     const recorder = FakeRecorder.instances[0];
     recorder.emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
     expect(FakeAudioContext.instances).toHaveLength(2);
     expect(recorder.stream.track.stop).toHaveBeenCalled();
   });
@@ -212,7 +212,51 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
     FakeRecorder.instances[0].emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new KeyboardEvent("keyup", { key: " ", bubbles: true })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
+  });
+
+  it("supports PageDown hold-to-talk without duplicate recorders", async () => {
+    const onTranscript = await render();
+    const down = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
+    const repeat = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true, repeat: true });
+    await act(async () => {
+      expect(window.dispatchEvent(down)).toBe(false);
+      window.dispatchEvent(repeat);
+    });
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => {
+      expect(window.dispatchEvent(new KeyboardEvent("keyup", { key: "PageDown", bubbles: true, cancelable: true }))).toBe(false);
+    });
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
+  });
+
+  it("ignores PageDown from editable controls without preventing default", async () => {
+    await render();
+    const controls = ["input", "textarea", "select"].map((tag) => document.createElement(tag));
+    const contenteditable = document.createElement("div");
+    contenteditable.setAttribute("contenteditable", "true");
+    controls.push(contenteditable);
+    for (const control of controls) {
+      document.body.append(control);
+      const event = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
+      await act(async () => control.dispatchEvent(event));
+      expect(event.defaultPrevented).toBe(false);
+      control.remove();
+    }
+    expect(FakeRecorder.instances).toHaveLength(0);
+  });
+
+  it("releases an active PageDown recording even when focus moves to an input", async () => {
+    await render();
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(FakeRecorder.instances).toHaveLength(1));
+    const input = document.createElement("input");
+    document.body.append(input);
+    await act(async () => input.dispatchEvent(new KeyboardEvent("keyup", { key: "PageDown", bubbles: true, cancelable: true })));
+    expect(FakeRecorder.instances[0].state).toBe("inactive");
+    input.remove();
   });
 
   function autoSendToggle() {
@@ -239,6 +283,23 @@ describe("PushToTalkButton", () => {
     await startRecording();
     FakeRecorder.instances[0].emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
-    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", false));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", false, { enabled: false, path: "transcript.txt" }));
+  });
+
+  it("persists transcript autosave settings and attaches them to a voice send", async () => {
+    const onTranscript = await render();
+    const enabled = container.querySelector('input[aria-label="Save sent prompts"]') as HTMLInputElement;
+    const path = container.querySelector('input[aria-label="Transcript output path"]') as HTMLInputElement;
+    await act(async () => enabled.click());
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(path, "notes/voice.txt");
+      path.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(window.localStorage.getItem("hermes.transcriptAutosave.enabled")).toBe("1");
+    expect(window.localStorage.getItem("hermes.transcriptAutosave.path")).toBe("notes/voice.txt");
+    await startRecording();
+    FakeRecorder.instances[0].emit(new Blob(["audio"]));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: true, path: "notes/voice.txt" }));
   });
 });

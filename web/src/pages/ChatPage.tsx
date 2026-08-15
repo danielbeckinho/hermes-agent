@@ -32,7 +32,11 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
-import { PushToTalkButton } from "@/components/PushToTalkButton";
+import {
+  PushToTalkButton,
+  readTranscriptAutosaveSettings,
+  type TranscriptAutosaveSettings,
+} from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api, fetchJSON } from "@/lib/api";
@@ -478,7 +482,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     termRef.current?.focus();
   };
 
-  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean) => {
+  const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
+    if (!settings.enabled || !settings.path.trim() || !text.trim()) return;
+    void fetchJSON("/api/dashboard/transcript-autosave", {
+      body: JSON.stringify({ path: settings.path, text }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }).catch(() => {});
+  }, []);
+
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean, autosave: TranscriptAutosaveSettings) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     // A newer capture always discards any prior unsubmitted manual draft's
@@ -490,6 +503,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       pendingVoiceTurnRef.current = "awaiting-start";
       ws.send(`${transcript}\uE000`);
       ws.send("\r");
+      savePrompt(transcript, autosave);
       return;
     }
     // Manual mode: drop the plain transcript into the PTY input line only.
@@ -497,8 +511,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // themselves via the onData handler below.
     pendingVoiceTurnRef.current = "idle";
     manualVoiceDraftPendingRef.current = true;
+    ptyInputLineRef.current = transcript;
     ws.send(transcript);
-  }, []);
+  }, [savePrompt]);
 
   const handleVoiceStart = useCallback((payload: unknown) => {
     if (
@@ -1274,6 +1289,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
+        const submittedLine = ptyInputLineRef.current;
         const normalized = normalizePtyMobileInput(
           data,
           ptyInputLineRef.current,
@@ -1301,6 +1317,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           ws.send("");
         }
         ws.send(normalized.data);
+        if ((normalized.data.includes("\r") || normalized.data.includes("\n")) && submittedLine.trim()) {
+          savePrompt(submittedLine);
+        }
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {

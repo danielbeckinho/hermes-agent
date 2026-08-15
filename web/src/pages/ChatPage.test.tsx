@@ -92,6 +92,7 @@ vi.mock("@/components/PushToTalkButton", () => ({
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
+  readTranscriptAutosaveSettings: () => ({ enabled: false, path: "transcript.txt" }),
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,

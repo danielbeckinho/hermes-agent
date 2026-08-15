@@ -1320,6 +1320,7 @@ def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
 from hermes_cli.web_models import (  # noqa: F401
     ConfigUpdate,
     EnvVarUpdate,
+    TranscriptAutosaveAppend,
     EnvVarDelete,
     EnvVarReveal,
     MemoryProviderConfigUpdate,
@@ -2756,6 +2757,9 @@ def _git_path(path: str) -> str:
 from hermes_cli.web_routers import git as _git_routes  # noqa: E402
 
 app.include_router(_git_routes.router)
+from hermes_cli.web_routers import transcripts as _transcript_routes  # noqa: E402
+
+app.include_router(_transcript_routes.router)
 from hermes_cli.web_routers.git import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     git_status_route,
     git_worktrees_route,

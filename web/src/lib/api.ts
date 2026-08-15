@@ -88,6 +88,7 @@ const PROFILE_SCOPED_PREFIXES = [
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
   "/api/pairing",
+  "/api/dashboard/transcript-autosave",
 ];
 
 function withManagementProfile(url: string): string {
