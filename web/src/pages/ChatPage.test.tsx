@@ -92,6 +92,7 @@ vi.mock("@/components/PushToTalkButton", () => ({
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
+  readTranscriptAutosaveSettings: () => ({ enabled: false, path: "transcript.txt" }),
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -243,6 +244,21 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("waits for the voice transcript to reach the PTY before submitting", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+
+    vi.useFakeTimers();
+    voiceState.onTranscript?.("voice prompt", true);
+    expect(ws.sent.slice(-1)).toEqual(["voice prompt\uE000"]);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ws.sent.slice(-2)).toEqual(["voice prompt\uE000", "\r"]);
+    vi.useRealTimers();
+  });
+
   it("does not speak an unrelated turn after a voice transcript", async () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
@@ -297,9 +313,13 @@ describe("ChatPage", () => {
     await act(async () => ws.onopen?.());
 
     voiceState.onTranscript?.("old manual", false);
+    vi.useFakeTimers();
     voiceState.onTranscript?.("new auto", true);
     await act(async () => terminal.onDataHandler?.("\r"));
+    expect(ws.sent.slice(-2)).toEqual(["new auto\uE000", "\r"]);
+    await vi.advanceTimersByTimeAsync(100);
     expect(ws.sent.slice(-3)).toEqual(["new auto\uE000", "\r", "\r"]);
+    vi.useRealTimers();
   });
 
   it("cancels manual voice draft on Ctrl-U, unrelated Enter has no marker", async () => {

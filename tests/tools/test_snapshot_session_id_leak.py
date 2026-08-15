@@ -50,6 +50,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -104,5 +105,24 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_excludes_delegated_child_marker(tmp_path):
+    """A child marker must not survive into a later non-child command."""
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with delegated_child_context():
+            env.init_session()
+            env.execute("true")
+
+        result = env.execute('printf "[%s]" "${HERMES_DELEGATED_CHILD_CONTEXT-unset}"')
+        assert result["output"] == "[unset]"
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in open(env._snapshot_path).read()
     finally:
         env.cleanup()

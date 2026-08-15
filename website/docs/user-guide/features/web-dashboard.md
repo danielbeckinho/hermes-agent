@@ -129,6 +129,12 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 
 Close the browser tab and the PTY is reaped cleanly on the server. Re-opening spawns a fresh session.
 
+#### Browser voice capture
+
+When browser voice capture is available, the Chat tab shows **hold to talk**. Hold the button or **PageDown** (outside ordinary text controls) to record; release to transcribe. **Auto-send** is on by default and submits the transcript through the existing PTY chat path. Turn it off to leave the transcript editable in the terminal instead.
+
+Optional **save prompts** appends each sent transcript to a relative file below the active profile's `transcripts/` directory (default: `transcript.txt`). The browser remembers the toggle and path. Absolute paths, traversal, and symlink escapes are rejected; this is text-only and does not retain audio.
+
 To point [Hermes Desktop](#connecting-hermes-desktop-to-a-remote-backend) at a dashboard running on another machine instead of its own bundled backend, see the remote-backend section below.
 
 ### Connecting Hermes Desktop to a remote backend
