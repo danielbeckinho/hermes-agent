@@ -32,9 +32,10 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { PushToTalkButton } from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, fetchJSON } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
@@ -177,6 +178,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const stickToBottomRef = useRef(true);
+  const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -493,6 +495,59 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
+
+  const handleVoiceTranscript = useCallback((transcript: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Private-use Unicode suffix is consumed by ui-tui before prompt.submit;
+    // ordinary typed input never carries this suffix. Send Return separately so
+    // Ink receives the completed line before it tokenizes the submit key.
+    pendingVoiceTurnRef.current = "awaiting-start";
+    ws.send(`${transcript}\uE000`);
+    setTimeout(() => {
+      const current = wsRef.current;
+      if (current && current.readyState === WebSocket.OPEN) current.send("\r");
+    }, 100);
+  }, []);
+
+  const handleVoiceStart = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current === "awaiting-start"
+      && typeof payload === "object"
+      && payload !== null
+      && (payload as { voice_turn?: unknown }).voice_turn === true
+    ) {
+      pendingVoiceTurnRef.current = "active";
+    }
+  }, []);
+
+  const handleVoiceCompletion = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current !== "active"
+      || typeof payload !== "object"
+      || payload === null
+      || (payload as { voice_turn?: unknown }).voice_turn !== true
+    ) return;
+    pendingVoiceTurnRef.current = "idle";
+    const text = typeof payload === "object" && payload !== null
+      ? String((payload as { text?: unknown }).text ?? "").trim()
+      : "";
+    if (!text) return;
+    void fetchJSON<{ data_url?: string }>(
+      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
+      {
+        body: JSON.stringify({ text }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ).then((response) => {
+      if (response.data_url) void new Audio(response.data_url).play().catch(() => {});
+    }).catch(() => {});
+  }, [scopedProfile]);
+
+  useEffect(() => () => {
+    pendingVoiceTurnRef.current = "idle";
+  }, [channel, reconnectNonce, scopedProfile]);
 
   useEffect(() => {
     // Don't spawn the chat PTY (and the TUI/agent bootstrap it triggers)
@@ -1645,6 +1700,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
@@ -1686,6 +1743,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+          <PushToTalkButton onTranscript={handleVoiceTranscript} profile={scopedProfile} />
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1816,6 +1874,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>

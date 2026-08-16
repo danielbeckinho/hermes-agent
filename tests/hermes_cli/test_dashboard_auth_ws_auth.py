@@ -375,6 +375,27 @@ class TestWsHostOriginGuardOrigins:
         ws = self._ws(origin="https://evil.test", host="fly-app.fly.dev")
         assert web_server._ws_host_origin_is_allowed(ws) is False
 
+    def test_explicit_alias_requires_matching_host_and_origin(self, monkeypatch):
+        monkeypatch.setattr(
+            web_server.app.state, "bound_host", "100.81.246.101", raising=False
+        )
+        monkeypatch.setattr(
+            web_server.app.state,
+            "allowed_hosts",
+            frozenset({"node-01.tail6ba6bf.ts.net"}),
+            raising=False,
+        )
+        allowed = self._ws(
+            host="node-01.tail6ba6bf.ts.net:443",
+            origin="https://node-01.tail6ba6bf.ts.net",
+        )
+        rejected = self._ws(
+            host="node-01.tail6ba6bf.ts.net:443", origin="https://evil.example"
+        )
+
+        assert web_server._ws_host_origin_is_allowed(allowed) is True
+        assert web_server._ws_host_origin_is_allowed(rejected) is False
+
 
 
 class TestSidecarUrl:

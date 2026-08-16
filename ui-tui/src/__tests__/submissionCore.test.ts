@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps } from '../app/submissionCore.js'
+import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps, VOICE_TURN_MARKER } from '../app/submissionCore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 
@@ -96,6 +96,26 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     expect(calls).not.toContain('input.detect_drop')
   })
 
+  it('removes the private voice marker before drop detection and agent input', async () => {
+    const requests: Array<[string, Record<string, unknown>]> = []
+
+    const gw = {
+      request: vi.fn((method: string, params: Record<string, unknown>) => {
+        requests.push([method, params])
+
+        return Promise.resolve(method === 'input.detect_drop' ? { matched: false } : { status: 'streaming' })
+      })
+    } as unknown as GatewayClient
+
+    // A key can arrive in the dashboard's PTY pacing window after the marker.
+    // The marker remains protocol-only; it must never reach the agent or UI.
+    submitPrompt(`voice${VOICE_TURN_MARKER} text`, makeDeps(gw))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(requests[0]).toEqual(['input.detect_drop', { session_id: 'sess-1', text: 'voice text' }])
+    expect(requests[1]).toEqual(['prompt.submit', { session_id: 'sess-1', text: 'voice text', voice_turn: true }])
+  })
   it('after detect_drop resolves (no file), it issues prompt.submit', async () => {
     const { calls, gw, resolveDrop } = makeDeferredGateway()
 

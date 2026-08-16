@@ -81,6 +81,7 @@ class FakeTerminal {
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  fetchJSON: vi.fn(async () => ({ data_url: "data:audio/wav;base64,AA==" })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -88,8 +89,19 @@ vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
 vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal }));
+const { sidebarState } = vi.hoisted(() => ({ sidebarState: { current: {} as Record<string, ((payload: unknown) => void) | undefined> } }));
 vi.mock("@/components/ChatSidebar", () => ({
-  ChatSidebar: () => null,
+  ChatSidebar: (props: Record<string, unknown>) => {
+    sidebarState.current = props as typeof sidebarState.current;
+    return null;
+  },
+}));
+const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string) => void) | null } }));
+vi.mock("@/components/PushToTalkButton", () => ({
+  PushToTalkButton: (props: { onTranscript: (text: string) => void }) => {
+    voiceState.onTranscript = props.onTranscript;
+    return null;
+  },
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -124,6 +136,7 @@ vi.mock("@/lib/dashboard-auth-reload", () => ({
 vi.mock("@/lib/api", () => ({
   api: apiMocks,
   buildWsUrl: apiMocks.buildWsUrl,
+  fetchJSON: apiMocks.fetchJSON,
 }));
 
 class FakeWebSocket {
@@ -137,6 +150,7 @@ class FakeWebSocket {
   readyState = FakeWebSocket.OPEN;
   url: string;
 
+  sent: string[] = [];
   constructor(url: string) {
     this.url = url;
     FakeWebSocket.instances.push(this);
@@ -146,7 +160,7 @@ class FakeWebSocket {
     this.readyState = 3;
   }
 
-  send() {}
+  send(value: string) { this.sent.push(value); }
 }
 
 type CloseEventLike = {
@@ -185,6 +199,17 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  apiMocks.fetchJSON.mockReset();
+  apiMocks.fetchJSON.mockResolvedValue({ data_url: "data:audio/wav;base64,AA==" });
+  sidebarState.current = {};
+  voiceState.onTranscript = null;
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    status: 200,
+    ok: true,
+    json: async () => ({ data_url: "data:audio/wav;base64,AA==" }),
+    clone() { return this; },
+  })));
+  vi.stubGlobal("Audio", class { play() { return Promise.resolve(); } });
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
@@ -250,6 +275,48 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("waits for the voice transcript to reach the PTY before submitting", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+
+    vi.useFakeTimers();
+    voiceState.onTranscript?.("voice prompt");
+    expect(ws.sent.slice(-1)).toEqual(["voice prompt\uE000"]);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(ws.sent.slice(-2)).toEqual(["voice prompt\uE000", "\r"]);
+    vi.useRealTimers();
+  });
+
+  it("does not speak an unrelated turn after a voice transcript", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt");
+    sidebarState.current.onMessageStart?.({ voice_turn: false });
+    sidebarState.current.onMessageComplete?.({ text: "unrelated reply", voice_turn: false });
+    await Promise.resolve();
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      expect.stringContaining("/api/audio/speak"),
+      expect.anything(),
+    );
+  });
+
+  it("speaks a completion carrying the voice marker", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt");
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    await vi.waitFor(() => expect(apiMocks.fetchJSON).toHaveBeenCalledWith(
+      expect.stringContaining("/api/audio/speak"),
+      expect.anything(),
+    ));
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 
