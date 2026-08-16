@@ -763,6 +763,15 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_clients[111] = mock_vc
         assert adapter.is_in_voice_channel(111) is True
 
+    def test_voice_binding_requires_matching_active_text_channel(self):
+        """Kanban VC notices must use the same live binding as Discord TTS."""
+        adapter = self._make_adapter()
+        adapter._voice_text_channels[111] = 123
+        adapter.is_in_voice_channel = MagicMock(side_effect=lambda gid: gid == 111)
+
+        assert adapter.is_voice_bound_to_chat("123") is True
+        assert adapter.is_voice_bound_to_chat("999") is False
+
 
     @pytest.mark.asyncio
     async def test_leave_voice_channel_processes_pending_audio_before_disconnect(self):
