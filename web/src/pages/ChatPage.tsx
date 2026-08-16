@@ -32,9 +32,10 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { PushToTalkButton } from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, fetchJSON } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
@@ -177,6 +178,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const stickToBottomRef = useRef(true);
+  const speechRef = useRef<HTMLAudioElement | null>(null);
+  const speechGenerationRef = useRef(0);
+  // Tracks whether the turn currently in flight was triggered by a PTT
+  // capture, so the TTS reply only plays for that turn — not for turns the
+  // user typed normally. "awaiting-start" until the PTY echoes the voice
+  // marker back on `message.start`; "active" until `message.complete`.
+  const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -474,6 +482,74 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     );
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+
+  // Voice-marked send: private-use suffix is stripped by ui-tui before
+  // prompt.submit and flips `voice_turn: true` on the request, which the
+  // gateway echoes back on message.start/message.complete (see
+  // submissionCore.ts VOICE_TURN_MARKER and tui_gateway/server.py
+  // _run_prompt_submit). That round-trip is how handleVoiceCompletion below
+  // knows the finished turn's reply should be spoken.
+  const handleVoiceTranscript = useCallback((transcript: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    pendingVoiceTurnRef.current = "awaiting-start";
+    ws.send(`${transcript}`);
+    setTimeout(() => {
+      const current = wsRef.current;
+      if (current && current.readyState === WebSocket.OPEN) current.send("\r");
+    }, 100);
+  }, []);
+
+  const handleVoiceStart = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current === "awaiting-start"
+      && typeof payload === "object"
+      && payload !== null
+      && (payload as { voice_turn?: unknown }).voice_turn === true
+    ) {
+      pendingVoiceTurnRef.current = "active";
+    }
+  }, []);
+
+  // Pause the current reply the instant the mic gesture starts (before the
+  // getUserMedia await), so playback doesn't bleed into the new recording.
+  const interruptSpeech = useCallback(() => {
+    speechRef.current?.pause();
+  }, []);
+
+  const resumeSpeech = useCallback(() => {
+    void speechRef.current?.play().catch(() => {});
+  }, []);
+
+  const handleVoiceCompletion = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current !== "active"
+      || typeof payload !== "object"
+      || payload === null
+      || (payload as { voice_turn?: unknown }).voice_turn !== true
+    ) return;
+    pendingVoiceTurnRef.current = "idle";
+    const text = String((payload as { text?: unknown }).text ?? "").trim();
+    if (!text) return;
+    const speechGeneration = ++speechGenerationRef.current;
+    void fetchJSON<{ data_url?: string }>(
+      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
+      {
+        body: JSON.stringify({ text }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ).then((response) => {
+      if (!response.data_url || speechGeneration !== speechGenerationRef.current) return;
+      speechRef.current?.pause();
+      const speech = new Audio(response.data_url);
+      speech.onended = () => {
+        if (speechRef.current === speech) speechRef.current = null;
+      };
+      speechRef.current = speech;
+      void speech.play().catch(() => {});
+    }).catch(() => {});
+  }, [scopedProfile]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -1646,6 +1722,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
               />
             </div>
             <ChatSessionList
@@ -1685,6 +1763,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           <div
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+          />
+
+          <PushToTalkButton
+            onTranscript={handleVoiceTranscript}
+            onGestureStart={interruptSpeech}
+            onGestureEnd={resumeSpeech}
+            profile={scopedProfile}
           />
 
           {showReconnectOverlay && (
@@ -1817,6 +1902,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
               />
             </div>
 

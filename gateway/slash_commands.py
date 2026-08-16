@@ -3206,11 +3206,34 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform)
 
         if args in {"on", "enable"}:
-            self._voice_mode[voice_key] = "voice_only"
+            # `/voice join` binds a Discord guild's active VC to this text
+            # channel and sets all-replies mode. Keep `/voice on` idempotent
+            # for that live bound session instead of silently downgrading it
+            # to voice-only replies.
+            guild_id = self._get_guild_id(event)
+            linked_chat_id = (
+                getattr(adapter, "_voice_text_channels", {}).get(guild_id)
+                if guild_id and adapter
+                else None
+            )
+            is_linked_live_discord_voice = (
+                getattr(platform, "value", platform) == "discord"
+                and linked_chat_id is not None
+                and str(linked_chat_id) == str(chat_id)
+                and callable(getattr(adapter, "is_in_voice_channel", None))
+                and adapter.is_in_voice_channel(guild_id)
+            )
+            self._voice_mode[voice_key] = (
+                "all" if is_linked_live_discord_voice else "voice_only"
+            )
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
-            return t("gateway.voice.enabled_voice_only")
+            return t(
+                "gateway.voice.tts_enabled"
+                if is_linked_live_discord_voice
+                else "gateway.voice.enabled_voice_only"
+            )
         elif args in {"off", "disable"}:
             self._voice_mode[voice_key] = "off"
             self._save_voice_modes()

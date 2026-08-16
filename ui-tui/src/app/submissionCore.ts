@@ -7,6 +7,10 @@ import { getUiState, patchUiState } from './uiStore.js'
 
 const SESSION_BUSY_RE = /session busy|waiting for model response/i
 
+// Private PTY-only suffix used by the dashboard voice button. It is removed
+// before any display, drop detection, expansion, or gateway submission.
+export const VOICE_TURN_MARKER = ''
+
 export const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
 
 export interface SubmitPromptDeps {
@@ -51,6 +55,8 @@ export function submitPrompt(
   showUserMessage = true,
   displayOverride?: string
 ): void {
+  const voiceTurn = text.endsWith(VOICE_TURN_MARKER)
+  const cleanText = voiceTurn ? text.slice(0, -VOICE_TURN_MARKER.length) : text
   const sid = getUiState().sid
 
   if (!sid) {
@@ -68,7 +74,7 @@ export function submitPrompt(
     }
 
     turnController.clearStatusTimer()
-    deps.setLastUserMsg(text)
+    deps.setLastUserMsg(cleanText)
 
     if (show) {
       deps.appendMessage({ role: 'user', text: displayOverride || displayText })
@@ -79,7 +85,11 @@ export function submitPrompt(
     turnController.interrupted = false
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>('prompt.submit', {
+        session_id: liveSid,
+        text: submitText,
+        ...(voiceTurn ? { voice_turn: true } : {}),
+      })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the
@@ -114,13 +124,13 @@ export function submitPrompt(
   // in place. Announcing it a second time above the status bar was the old
   // out-of-band attachment UI.
   deps.gw
-    .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
+    .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text: cleanText })
     .then(r => {
       if (!r?.matched) {
-        return startSubmit(text, deps.expand(text), showUserMessage)
+        return startSubmit(cleanText, deps.expand(cleanText), showUserMessage)
       }
 
-      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)
+      startSubmit(r.text || cleanText, deps.expand(r.text || cleanText), showUserMessage)
     })
-    .catch(() => startSubmit(text, deps.expand(text), showUserMessage))
+    .catch(() => startSubmit(cleanText, deps.expand(cleanText), showUserMessage))
 }

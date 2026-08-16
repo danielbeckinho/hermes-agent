@@ -10406,6 +10406,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    voice_turn: bool = False,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10452,7 +10453,7 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    _emit("message.start", sid, {"voice_turn": True} if voice_turn else None)
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -10963,6 +10964,8 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
+            if voice_turn:
+                payload["voice_turn"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 

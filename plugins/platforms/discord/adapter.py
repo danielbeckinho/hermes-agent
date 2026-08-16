@@ -141,6 +141,7 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import _hash_id
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -4401,6 +4402,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return timeout for this clip: configured floor or duration+padding."""
         floor = float(self._playback_timeout_limit())
         duration = await asyncio.to_thread(self._probe_audio_duration_seconds, audio_path)
+        self._last_probed_duration = duration  # diagnostic-only: read by lifecycle logging
         if not duration or duration <= 0:
             return floor
         return max(floor, duration + float(self.PLAYBACK_TIMEOUT_PADDING))
@@ -4637,6 +4639,53 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
+    def _log_voice_playback(
+        self,
+        *,
+        playback_id: str,
+        guild_id: int,
+        text_channel_id: Optional[int],
+        connected: bool,
+        outcome: str,
+        path: Optional[str] = None,
+        audio_suffix: Optional[str] = None,
+        audio_byte_count: Optional[int] = None,
+        duration_s: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+        callback_reached: bool = False,
+        error_class: Optional[str] = None,
+        mixer_decode_failed: bool = False,
+        elapsed_s: Optional[float] = None,
+        timed_out: bool = False,
+        stop_issued: bool = False,
+    ) -> None:
+        """Emit one sanitized, structured lifecycle record for a VC playback
+        attempt. Never includes transcript/audio content, tokens, or names —
+        guild/text-channel identifiers are bounded hashes, not raw IDs, and
+        errors are represented only by their bounded exception class name,
+        never the free-text message (which can carry paths/secrets/PII).
+        """
+        record = {
+            "event": "discord_voice_playback",
+            "playback_id": playback_id,
+            "guild_id": _hash_id(str(guild_id)),
+            "text_channel_id": _hash_id(str(text_channel_id)) if text_channel_id is not None else None,
+            "connected": connected,
+            "path": path,
+            "audio_suffix": audio_suffix,
+            "audio_byte_count": audio_byte_count,
+            "duration_s": round(duration_s, 3) if duration_s is not None else None,
+            "timeout_s": round(timeout_s, 3) if timeout_s is not None else None,
+            "callback_reached": callback_reached,
+            "error_class": error_class,
+            "mixer_decode_failed": mixer_decode_failed,
+            "elapsed_s": round(elapsed_s, 3) if elapsed_s is not None else None,
+            "timed_out": timed_out,
+            "stop_issued": stop_issued,
+            "outcome": outcome,
+        }
+        logger.info("discord_voice_playback %s", json.dumps(record))
+
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
 
@@ -4644,10 +4693,27 @@ class DiscordAdapter(BasePlatformAdapter):
         decoded to PCM and layered over the ambient bed (ducking it) so the
         reply can overlap the idle "thinking" loop seamlessly.  Otherwise we
         fall back to the legacy one-shot FFmpegPCMAudio path.
+
+        Emits one sanitized structured lifecycle log per attempt (see
+        ``_log_voice_playback``) for diagnosing silent-playback gaps.
         """
+        import uuid as _uuid
+        playback_id = _uuid.uuid4().hex[:12]
+        text_channel_id = self._voice_text_channels.get(guild_id)
+
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
+            self._log_voice_playback(
+                playback_id=playback_id, guild_id=guild_id, text_channel_id=text_channel_id,
+                connected=False, outcome="not_connected",
+            )
             return False
+
+        audio_suffix = os.path.splitext(audio_path)[1]
+        try:
+            audio_byte_count = os.path.getsize(audio_path)
+        except OSError:
+            audio_byte_count = None
 
         # Playback is activity. Do not let the inactivity timer disconnect the
         # bot while duration probing, decoding, or speaking; re-arm it when this
@@ -4655,6 +4721,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._cancel_voice_timeout(guild_id)
         try:
             playback_timeout = await self._playback_timeout_for_audio(audio_path)
+            duration_s = getattr(self, "_last_probed_duration", None)
+            mixer_decode_failed = False
 
             # ── Mixer path (overlap + ducking) ──────────────────────────────
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
@@ -4670,15 +4738,30 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Block until the speech child drains so callers serialise
                     # replies (mirrors legacy semantics) but the ambient keeps
                     # playing underneath the whole time.
-                    wait_start = time.monotonic()
+                    start = time.monotonic()
+                    wait_start = start
+                    timed_out = False
                     while mixer.speech_active:
                         if time.monotonic() - wait_start > playback_timeout:
                             logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
                             mixer.stop_speech()
+                            timed_out = True
                             break
                         await asyncio.sleep(0.05)
+                    self._log_voice_playback(
+                        playback_id=playback_id, guild_id=guild_id, text_channel_id=text_channel_id,
+                        connected=True, path="mixer", audio_suffix=audio_suffix,
+                        audio_byte_count=audio_byte_count, duration_s=duration_s,
+                        timeout_s=playback_timeout, callback_reached=True,
+                        elapsed_s=time.monotonic() - start, timed_out=timed_out,
+                        stop_issued=timed_out, outcome="timeout" if timed_out else "completed",
+                    )
                     return True
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+                # Diagnostic-only: recorded on the single final record emitted
+                # below (mixer decode failure never terminates the attempt on
+                # its own — legacy fallback always runs), not as its own log.
+                mixer_decode_failed = True
 
             # ── Legacy one-shot path (no mixer) ─────────────────────────
             # Pause voice receiver while playing (echo prevention)
@@ -4698,10 +4781,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 done = asyncio.Event()
                 loop = asyncio.get_running_loop()
+                callback_state: Dict[str, Any] = {"reached": False, "error": None}
 
                 def _after(error):
+                    callback_state["reached"] = True
+                    callback_state["error"] = error
                     if error:
-                        logger.error("Voice playback error: %s", error)
+                        # Bounded classification only — the exception's free-text
+                        # message can carry paths/secrets/PII and must never be
+                        # logged (see _log_voice_playback's error_class field).
+                        logger.error("Voice playback callback error: %s", type(error).__name__)
                     loop.call_soon_threadsafe(done.set)
 
                 # Prepend a short lead of silence so the voice socket's warm-up
@@ -4720,12 +4809,34 @@ class DiscordAdapter(BasePlatformAdapter):
                     **ffmpeg_opts,
                 )
                 source = discord.PCMVolumeTransformer(source, volume=1.0)
+                start = time.monotonic()
                 vc.play(source, after=_after)
+                stop_issued = False
+                timed_out = False
                 try:
                     await asyncio.wait_for(done.wait(), timeout=playback_timeout)
                 except asyncio.TimeoutError:
                     logger.warning("Voice playback timed out after %.1fs", playback_timeout)
                     vc.stop()
+                    timed_out = True
+                    stop_issued = True
+                error = callback_state["error"]
+                if timed_out:
+                    outcome = "timeout"
+                elif error:
+                    outcome = "callback_error"
+                else:
+                    outcome = "completed"
+                self._log_voice_playback(
+                    playback_id=playback_id, guild_id=guild_id, text_channel_id=text_channel_id,
+                    connected=True, path="legacy", audio_suffix=audio_suffix,
+                    audio_byte_count=audio_byte_count, duration_s=duration_s,
+                    timeout_s=playback_timeout, callback_reached=callback_state["reached"],
+                    error_class=type(error).__name__ if error else None,
+                    mixer_decode_failed=mixer_decode_failed,
+                    elapsed_s=time.monotonic() - start, timed_out=timed_out,
+                    stop_issued=stop_issued, outcome=outcome,
+                )
                 return True
             finally:
                 if receiver:

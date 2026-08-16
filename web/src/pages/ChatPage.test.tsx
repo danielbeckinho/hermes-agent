@@ -269,6 +269,20 @@ describe("ChatPage", () => {
 
     expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
   });
+
+  it("wires the push-to-talk control into the chat input", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(container.querySelector('[aria-label="Hold to talk"]')).not.toBeNull();
+  });
 });
 
 describe("ChatPage side panel collapse", () => {
