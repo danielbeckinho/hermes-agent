@@ -72,7 +72,8 @@ class TestCollectKanbanNotifications:
         first = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
-        assert tid in first[0]
+        assert "notify tui" in first[0]
+        assert "tui" in first[0]
         assert "done" in first[0]
         assert "shipped the fix" in first[0]
         rows = _sub_rows(tid)
@@ -128,6 +129,7 @@ class TestCollectKanbanNotifications:
             second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
+        assert "notify tui" in first[0]
         assert "blocked" in first[0]
         assert "waiting on review" in first[0]
         assert second == []
@@ -180,7 +182,8 @@ class TestCollectKanbanNotifications:
             texts = _collect_kanban_notifications(_session())
 
         assert len(texts) == 1
-        assert tid in texts[0]
+        assert "notify tui" in texts[0]
+        assert "t_" not in texts[0]
         spy_connect.assert_called_once()
 
     def test_no_session_key_is_a_noop(self):
@@ -223,7 +226,7 @@ class TestCollectKanbanNotifications:
             reset_hermes_home_override(token)
 
         assert len(texts) == 1
-        assert tid in texts[0]
+        assert "notify tui" in texts[0]
         assert "cross-profile delivery" in texts[0]
         # Completion is reversible, so the shared-board subscription remains
         # owned by this exact Desktop session until the task is archived.
@@ -244,11 +247,12 @@ class TestFormatKanbanEventText:
     def test_blocked_includes_reason(self):
         ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
-        assert "t_abc123" in text
+        assert "build the thing" in text
         assert "blocked" in text
         assert "needs creds" in text
         assert "[main]" in text
         assert "@worker" in text
+        assert "t_abc123" not in text
 
     def test_completed_prefers_payload_summary(self):
         ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})
@@ -328,9 +332,9 @@ class TestNotificationPollerLoopKanbanWiring:
             thread.join(timeout=5)
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
-        assert any(tid in t for t in status_texts), status_texts
+        assert any("notify tui" in t for t in status_texts), status_texts
         assert any(e == "message.start" for e, _ in emits)
-        assert any(tid in text for text in submits), submits
+        assert any("notify tui" in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
@@ -357,6 +361,6 @@ class TestNotificationPollerLoopKanbanWiring:
             stop.set()
             thread.join(timeout=5)
 
-        assert any(tid in text for text in submits), submits
+        assert any("notify tui" in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True

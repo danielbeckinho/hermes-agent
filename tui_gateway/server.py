@@ -9682,7 +9682,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if not kind or kind in _KANBAN_SILENT_KINDS:
         return None
     task_id = sub.get("task_id", "")
-    title = (getattr(task, "title", None) or task_id)[:120]
+    title = (getattr(task, "title", None) or "Kanban task")[:120]
     board_tag = f"[{board_slug}] " if board_slug else ""
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
@@ -9696,24 +9696,24 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         elif getattr(task, "result", None):
             lines = str(task.result).strip().splitlines()
             handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        return f"✔ {board_tag}{tag}{title} done{handoff}"
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        return f"⏸ {board_tag}{tag}{title} blocked{reason}"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        return f"✖ {board_tag}{tag}{title} gave up after repeated spawn failures{err}"
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        return f"✖ {board_tag}{tag}{title} worker crashed (pid gone); dispatcher will retry"
     if kind == "timed_out":
         limit = 0
         try:
             limit = int(payload.get("limit_seconds") or 0)
         except (TypeError, ValueError):
             pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        return f"⏱ {board_tag}{tag}{title} timed out (max_runtime={limit}s); will retry"
     if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        return f"🔄 {board_tag}{tag}{title} → {payload.get('status') or ''}"
     return None
 
 
