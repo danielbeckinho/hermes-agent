@@ -11,7 +11,8 @@ interface PushToTalkButtonProps {
   // caller unlock playback of a later, async TTS reply — some browsers
   // (Safari) only honor programmatic audio.play() if the same element was
   // played at least once during a real user gesture.
-  onGestureStart?: () => void;
+  onGestureStart?: (cancel: boolean) => void;
+  onGestureEnd?: () => void;
   profile?: string;
 }
 
@@ -26,6 +27,7 @@ export interface TranscriptAutosaveSettings {
 // submit themselves (manual). Absent (never toggled, or storage blocked)
 // means auto-send stays on.
 const AUTO_SEND_KEY = "hermes.voice.autoSend";
+const DOUBLE_TAP_CANCEL_MS = 300;
 export const TRANSCRIPT_AUTOSAVE_ENABLED_KEY = "hermes.transcriptAutosave.enabled";
 export const TRANSCRIPT_AUTOSAVE_PATH_KEY = "hermes.transcriptAutosave.path";
 function readAutoSend(): boolean {
@@ -94,7 +96,7 @@ function playCue(frequency: number): void {
   }
 }
 
-export function PushToTalkButton({ onTranscript, onGestureStart, profile }: PushToTalkButtonProps) {
+export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, profile }: PushToTalkButtonProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const requestingRef = useRef(false);
@@ -103,6 +105,8 @@ export function PushToTalkButton({ onTranscript, onGestureStart, profile }: Push
   const recordingRef = useRef(false);
   const pageUpHeldRef = useRef(false);
   const pageDownHeldRef = useRef(false);
+  const gestureStartedAtRef = useRef(0);
+  const lastTapAtRef = useRef(0);
   const [state, setState] = useState<"idle" | "requesting" | "recording" | "error">("idle");
   const [autoSend, setAutoSend] = useState(() => readAutoSend());
   const [autosave, setAutosave] = useState(() => readTranscriptAutosaveSettings());
@@ -113,6 +117,9 @@ export function PushToTalkButton({ onTranscript, onGestureStart, profile }: Push
 
   const release = useCallback(() => {
     holdingRef.current = false;
+    const now = Date.now();
+    lastTapAtRef.current = now - gestureStartedAtRef.current <= DOUBLE_TAP_CANCEL_MS ? now : 0;
+    onGestureEnd?.();
     if (!recordingRef.current) {
       setState((prev) => (prev === "error" ? prev : "idle"));
       return;
@@ -121,13 +128,17 @@ export function PushToTalkButton({ onTranscript, onGestureStart, profile }: Push
     setState("idle");
     playCue(440);
     recorderRef.current?.stop();
-  }, []);
+  }, [onGestureEnd]);
 
   const start = useCallback(async (options?: { autoSend?: boolean; autosave?: TranscriptAutosaveSettings }) => {
     if (requestingRef.current || recordingRef.current) return;
     // Still synchronous within the triggering gesture's call stack — must
     // run before the getUserMedia await below breaks that chain.
-    onGestureStart?.();
+    const now = Date.now();
+    const cancel = lastTapAtRef.current > 0 && now - lastTapAtRef.current <= DOUBLE_TAP_CANCEL_MS;
+    lastTapAtRef.current = 0;
+    gestureStartedAtRef.current = now;
+    onGestureStart?.(cancel);
     holdingRef.current = true;
     requestingRef.current = true;
     setState("requesting");
