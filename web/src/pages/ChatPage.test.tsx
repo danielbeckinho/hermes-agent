@@ -289,6 +289,21 @@ describe("ChatPage", () => {
     vi.useRealTimers();
   });
 
+  it("does not write a transcript for a plain voice send even when autosave is enabled", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+
+    // Checkbox on makes Send + Save available, but a plain Send (PgUp) must
+    // NOT append to the transcript file — only an explicit Send + Save does.
+    voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt" });
+
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+  });
+
   it("does not speak an unrelated turn after a voice transcript", async () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);

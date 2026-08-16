@@ -483,10 +483,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   };
 
   const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
-    if (!settings.enabled || !settings.path.trim() || !text.trim()) return;
-    const savedText = settings.timestamp
-      ? text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n")
-      : text;
+    // Only an explicit Send + Save (PgDown) sets timestamp:true. A plain
+    // voice send passes the bare checkbox settings (no timestamp), so it
+    // must never append to the transcript file, even when enabled.
+    if (!settings.timestamp || !settings.path.trim() || !text.trim()) return;
+    const savedText = text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n");
     void fetchJSON("/api/dashboard/transcript-autosave", {
       body: JSON.stringify({ path: settings.path, text: savedText }),
       headers: { "Content-Type": "application/json" },

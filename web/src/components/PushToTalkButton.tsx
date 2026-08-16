@@ -6,6 +6,12 @@ import { fetchJSON } from "@/lib/api";
 
 interface PushToTalkButtonProps {
   onTranscript: (transcript: string, autoSend: boolean, autosave: TranscriptAutosaveSettings) => void;
+  // Fired synchronously at the top of the mic gesture (before any await),
+  // while still inside the triggering click/keydown's call stack. Lets the
+  // caller unlock playback of a later, async TTS reply — some browsers
+  // (Safari) only honor programmatic audio.play() if the same element was
+  // played at least once during a real user gesture.
+  onGestureStart?: () => void;
   profile?: string;
 }
 
@@ -88,7 +94,7 @@ function playCue(frequency: number): void {
   }
 }
 
-export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProps) {
+export function PushToTalkButton({ onTranscript, onGestureStart, profile }: PushToTalkButtonProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const requestingRef = useRef(false);
@@ -119,6 +125,9 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
 
   const start = useCallback(async (options?: { autoSend?: boolean; autosave?: TranscriptAutosaveSettings }) => {
     if (requestingRef.current || recordingRef.current) return;
+    // Still synchronous within the triggering gesture's call stack — must
+    // run before the getUserMedia await below breaks that chain.
+    onGestureStart?.();
     holdingRef.current = true;
     requestingRef.current = true;
     setState("requesting");
@@ -168,7 +177,7 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
     } finally {
       requestingRef.current = false;
     }
-  }, [autosave, onTranscript, profile]);
+  }, [autosave, onGestureStart, onTranscript, profile]);
 
   useEffect(() => {
     const isEditable = (target: EventTarget | null): boolean =>
@@ -315,9 +324,9 @@ export function PushToTalkButton({ onTranscript, profile }: PushToTalkButtonProp
             writeTranscriptAutosaveSettings(next);
             setAutosave(next);
           }}
-          aria-label="Save sent prompts"
+          aria-label="Save transcripts"
         />
-        save prompts
+        save transcripts
       </label>
       <input
         className="w-28 rounded border border-current/30 bg-black/20 px-1 py-1 text-xs"

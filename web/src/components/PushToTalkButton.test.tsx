@@ -175,7 +175,7 @@ describe("PushToTalkButton", () => {
 
   it("sends and timestamps a held transcript when saving", async () => {
     const onTranscript = await render();
-    const saveToggle = container.querySelector('input[aria-label="Save sent prompts"]') as HTMLInputElement;
+    const saveToggle = container.querySelector('input[aria-label="Save transcripts"]') as HTMLInputElement;
     await act(async () => saveToggle.click());
     const sendAndSave = container.querySelector('button[aria-label="Send + Save (PgDown)"]') as HTMLButtonElement;
     await act(async () => sendAndSave.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
@@ -259,7 +259,7 @@ describe("PushToTalkButton", () => {
 
   it("sends and saves when PageDown is held on its control", async () => {
     const onTranscript = await render();
-    const saveToggle = container.querySelector('input[aria-label="Save sent prompts"]') as HTMLInputElement;
+    const saveToggle = container.querySelector('input[aria-label="Save transcripts"]') as HTMLInputElement;
     await act(async () => saveToggle.click());
     const sendAndSave = container.querySelector('button[aria-label="Send + Save (PgDown)"]') as HTMLButtonElement;
     await act(async () => sendAndSave.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true })));
@@ -296,7 +296,7 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("voice input", true, { enabled: false, path: "transcript.txt" }));
   });
 
-  it("ignores a page-level PageDown when Save prompts is off, captures it once turned on", async () => {
+  it("ignores a page-level PageDown when Save transcripts is off, captures it once turned on", async () => {
     await render();
     document.body.focus();
     const offEvent = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
@@ -304,7 +304,7 @@ describe("PushToTalkButton", () => {
     expect(offEvent.defaultPrevented).toBe(false);
     expect(FakeRecorder.instances).toHaveLength(0);
 
-    const saveToggle = container.querySelector('input[aria-label="Save sent prompts"]') as HTMLInputElement;
+    const saveToggle = container.querySelector('input[aria-label="Save transcripts"]') as HTMLInputElement;
     await act(async () => saveToggle.click());
     const onEvent = new KeyboardEvent("keydown", { key: "PageDown", bubbles: true, cancelable: true });
     await act(async () => window.dispatchEvent(onEvent));
@@ -361,7 +361,7 @@ describe("PushToTalkButton", () => {
 
   it("persists transcript autosave settings and attaches them to a voice send", async () => {
     const onTranscript = await render();
-    const enabled = container.querySelector('input[aria-label="Save sent prompts"]') as HTMLInputElement;
+    const enabled = container.querySelector('input[aria-label="Save transcripts"]') as HTMLInputElement;
     const path = container.querySelector('input[aria-label="Transcript output path"]') as HTMLInputElement;
     await act(async () => enabled.click());
     await act(async () => {
