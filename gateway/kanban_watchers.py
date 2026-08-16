@@ -247,14 +247,13 @@ class GatewayKanbanWatchersMixin:
             return
         sent.add(event_key)
 
-        task_id = ev.task_id
-        title = (task.title if task else task_id)[:120]
+        title = (task.title if task else "Kanban task")[:120]
         reason = str((ev.payload or {}).get("reason") or "no reason given")[:300]
         board_tag = f"[{board_slug}] " if board_slug else ""
         text = (
-            f"🗳️ {board_tag}Decision needed — Kanban {task_id}: {title}\n"
+            f"🗳️ {board_tag}Decision needed — {title}\n"
             f"Blocked: {reason}\n"
-            f"Reply to this message naming task {task_id} with your choice."
+            "Reply to this message with your choice."
         )
         try:
             res = await adapter.send(_DECISIONS_CHANNEL_ID, text)
@@ -268,13 +267,13 @@ class GatewayKanbanWatchersMixin:
         speak = getattr(adapter, "speak_kanban_notice", None)
         if speak is None:
             return
-        task_id = ev.task_id
+        title = (task.title if task else "Kanban task")[:120]
         if ev.kind == "completed":
-            phrase = f"Task {task_id} completed."
+            phrase = f"{title} completed."
         elif ev.kind == "blocked":
-            phrase = f"Task {task_id} needs your input."
+            phrase = f"{title} needs your input."
         else:
-            phrase = f"Task {task_id} needs a decision."
+            phrase = f"{title} needs a decision."
         try:
             await speak(phrase)
         except Exception:
@@ -569,7 +568,7 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    title = (task.title if task else "Kanban task")[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
@@ -605,25 +604,24 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"✔ {board_tag}{tag}{title} done{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {board_tag}{tag}{title} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {board_tag}{tag}{title} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {board_tag}{tag}{title} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -631,14 +629,14 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {board_tag}{tag}{title} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                            msg = f"🔄 {board_tag}{tag}{title} → {new_status}"
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -655,7 +653,7 @@ class GatewayKanbanWatchersMixin:
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
+                                f"🛑 {board_tag}{tag}{title} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
@@ -826,7 +824,7 @@ class GatewayKanbanWatchersMixin:
                         if _wake_kinds:
                             _session_key = getattr(task, "session_id", None) or ""
                         if _wake_kinds and _session_key:
-                            _title = (task.title if task else sub["task_id"])[:120]
+                            _title = (task.title if task else "Kanban task")[:120]
                             _assignee = task.assignee if task else ""
                             _parts = []
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
