@@ -176,7 +176,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
             const transcript = response.transcript?.trim();
             if (transcript) onTranscript(transcript, options?.autoSend ?? autoSendRef.current, options?.autosave ?? autosave);
           })
-          .catch(() => {});
+          .catch(() => setState("error"));
       };
       recorder.start();
       recordingRef.current = true;
