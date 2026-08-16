@@ -88,7 +88,7 @@ export function submitPrompt(
       .request<PromptSubmitResponse>('prompt.submit', {
         session_id: liveSid,
         text: submitText,
-        ...(voiceTurn ? { voice_turn: true } : {}),
+        ...(voiceTurn ? { voice_turn: true } : {})
       })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice

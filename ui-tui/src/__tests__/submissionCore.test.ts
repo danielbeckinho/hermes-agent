@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps, VOICE_TURN_MARKER } from '../app/submissionCore.js'
+import {
+  isSessionBusyError,
+  markSubmitting,
+  submitPrompt,
+  type SubmitPromptDeps,
+  VOICE_TURN_MARKER
+} from '../app/submissionCore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 
@@ -98,9 +104,11 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
 
   it('removes the private voice marker before drop detection and agent input', async () => {
     const requests: Array<[string, Record<string, unknown>]> = []
+
     const gw = {
       request: vi.fn((method: string, params: Record<string, unknown>) => {
         requests.push([method, params])
+
         return Promise.resolve(method === 'input.detect_drop' ? { matched: false } : { status: 'streaming' })
       })
     } as unknown as GatewayClient
