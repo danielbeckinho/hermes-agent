@@ -171,6 +171,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const speechRef = useRef<HTMLAudioElement | null>(null);
+  const speechInterruptedRef = useRef(false);
+  const speechGenerationRef = useRef(0);
   const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
   // Set when a manual (auto-send off) voice capture wrote its transcript into
   // the PTY input line without submitting. Consumed by the onData handler
@@ -483,10 +486,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   };
 
   const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
-    if (!settings.enabled || !settings.path.trim() || !text.trim()) return;
-    const savedText = settings.timestamp
-      ? text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n")
-      : text;
+    // Only an explicit Send + Save (PgDown) sets timestamp:true. A plain
+    // voice send passes the bare checkbox settings (no timestamp), so it
+    // must never append to the transcript file, even when enabled.
+    if (!settings.timestamp || !settings.path.trim() || !text.trim()) return;
+    const savedText = text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n");
     void fetchJSON("/api/dashboard/transcript-autosave", {
       body: JSON.stringify({ path: settings.path, text: savedText }),
       headers: { "Content-Type": "application/json" },
@@ -532,6 +536,30 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     }
   }, []);
 
+  const interruptSpeech = useCallback((cancel: boolean) => {
+    if (cancel) {
+      speechGenerationRef.current += 1;
+      speechInterruptedRef.current = false;
+      const speech = speechRef.current;
+      if (speech) {
+        speech.pause();
+        speech.currentTime = 0;
+      }
+      speechRef.current = null;
+      return;
+    }
+    speechInterruptedRef.current = true;
+    const speech = speechRef.current;
+    if (!speech) return;
+    speech.pause();
+  }, []);
+
+  const resumeSpeech = useCallback(() => {
+    speechInterruptedRef.current = false;
+    const speech = speechRef.current;
+    if (speech) void speech.play().catch(() => {});
+  }, []);
+
   const handleVoiceCompletion = useCallback((payload: unknown) => {
     if (
       pendingVoiceTurnRef.current !== "active"
@@ -544,6 +572,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? String((payload as { text?: unknown }).text ?? "").trim()
       : "";
     if (!text) return;
+    const speechGeneration = speechGenerationRef.current;
     void fetchJSON<{ data_url?: string }>(
       `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
       {
@@ -552,7 +581,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         method: "POST",
       },
     ).then((response) => {
-      if (response.data_url) void new Audio(response.data_url).play().catch(() => {});
+      if (!response.data_url || speechGeneration !== speechGenerationRef.current) return;
+      const priorSpeech = speechRef.current;
+      if (priorSpeech) {
+        priorSpeech.pause();
+        priorSpeech.currentTime = 0;
+      }
+      const speech = new Audio(response.data_url);
+      speech.onended = () => {
+        if (speechRef.current === speech) speechRef.current = null;
+      };
+      speechRef.current = speech;
+      if (!speechInterruptedRef.current) void speech.play().catch(() => {});
     }).catch(() => {});
   }, [scopedProfile]);
 
@@ -1637,7 +1677,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
-          <PushToTalkButton onTranscript={handleVoiceTranscript} profile={scopedProfile} />
+          <PushToTalkButton
+            onGestureEnd={resumeSpeech}
+            onGestureStart={interruptSpeech}
+            onTranscript={handleVoiceTranscript}
+            profile={scopedProfile}
+          />
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">

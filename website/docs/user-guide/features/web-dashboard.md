@@ -133,7 +133,7 @@ Close the browser tab and the PTY is reaped cleanly on the server. Re-opening sp
 
 When browser voice capture is available, the Chat tab shows **hold to talk**. Hold the button or **PageDown** (outside ordinary text controls) to record; release to transcribe. **Auto-send** is on by default and submits the transcript through the existing PTY chat path. Turn it off to leave the transcript editable in the terminal instead.
 
-Optional **save prompts** appends each sent transcript to a relative file below the active profile's `transcripts/` directory (default: `transcript.txt`). The browser remembers the toggle and path. Absolute paths, traversal, and symlink escapes are rejected; this is text-only and does not retain audio.
+Optional **save transcripts** appends each spoken prompt sent via the **Send + Save (PgDown)** button/Hold to a relative file below the active profile's `transcripts/` directory (default: `transcript.txt`). Each non-empty line is prefixed with a UTC ISO timestamp. The browser remembers the toggle and path. A plain **Send (PgUp)** or typed chat text is never saved. Absolute paths, traversal, and symlink escapes are rejected; this is text-only and does not retain audio.
 
 To point [Hermes Desktop](#connecting-hermes-desktop-to-a-remote-backend) at a dashboard running on another machine instead of its own bundled backend, see the remote-backend section below.
 
