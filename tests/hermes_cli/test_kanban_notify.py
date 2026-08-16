@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import pytest
 
@@ -7,9 +8,50 @@ from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+def test_notify_subscribe_voice_metadata_and_parser(kanban_home):
+    from hermes_cli.kanban import _cmd_notify_subscribe, build_parser
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="voice task", assignee="worker")
+    finally:
+        conn.close()
+
+    args = SimpleNamespace(
+        task_id=task_id, platform="discord", chat_id="123", thread_id=None,
+        user_id=None, user_id_alt=None, chat_type=None, notifier_profile=None,
+        delivery_mode=None, voice=True,
+    )
+    assert _cmd_notify_subscribe(args) == 0
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, task_id)[0]["delivery_metadata"] == {
+            "discord_voice_notice": True,
+        }
+
+    parent = build_parser(argparse.ArgumentParser().add_subparsers(dest="action"))
+    parsed = parent.parse_args(["notify-subscribe", task_id, "--platform", "discord", "--chat-id", "123", "--voice"])
+    assert parsed.voice is True
+
+
+def test_notify_subscribe_voice_rejects_non_discord(kanban_home, capsys):
+    from hermes_cli.kanban import _cmd_notify_subscribe
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="text task", assignee="worker")
+    finally:
+        conn.close()
+    args = SimpleNamespace(
+        task_id=task_id, platform="telegram", chat_id="123", thread_id=None,
+        user_id=None, user_id_alt=None, chat_type=None, notifier_profile=None,
+        delivery_mode=None, voice=True,
+    )
+    assert _cmd_notify_subscribe(args) == 2
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, task_id) == []
+    assert "only supported" in capsys.readouterr().err
+
+
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
