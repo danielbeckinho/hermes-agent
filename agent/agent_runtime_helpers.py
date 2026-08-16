@@ -2964,6 +2964,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
+                    context=next_args.get("context", ""),
                     callback=agent.clarify_callback,
                 ),
                 next_args,

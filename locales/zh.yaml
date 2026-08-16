@@ -168,8 +168,7 @@ gateway:
       blocked:             "被阻塞，需要处理"
       status_default:      "状态变化"
       status_joiner:       "，"
-      message:             "[kanban] 任务 {task_id} {status}。\n标题: {title}\n执行者: @{assignee}\n看板: {board}\n\n请检查结果或决定下一步动作。"
-
+      message:             "[kanban] {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nInspect the current card. If it needs an owner decision, present a decision context first: why it is needed, impacts, real option comparison, maintenance fragility, recurring cost, evidence, and recommendation. Then use native clarify for selection only. Do not mutate, unblock, dispatch, or deploy from this notification."
   personality:
     none_configured:       "`{path}/config.yaml` 中未配置人格设定"
     header:                "🎭 **可用人格**\n"

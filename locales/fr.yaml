@@ -168,8 +168,7 @@ gateway:
       blocked:             "blocked; needs attention"
       status_default:      "status changed"
       status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
-
+      message:             "[kanban] {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nInspect the current card. If it needs an owner decision, present a decision context first: why it is needed, impacts, real option comparison, maintenance fragility, recurring cost, evidence, and recommendation. Then use native clarify for selection only. Do not mutate, unblock, dispatch, or deploy from this notification."
   personality:
     none_configured:       "Aucune personnalité configurée dans `{path}/config.yaml`"
     header:                "🎭 **Personnalités disponibles**\n"

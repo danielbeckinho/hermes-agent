@@ -17577,6 +17577,14 @@ def start_server(
         for allowed_host in allowed_hosts or []
         if (normalized := _host_without_port(allowed_host).lower())
     )
+    # FastAPI runs later-declared middleware first. Keep the Host guard before
+    # auth so an attacker hostname cannot receive an auth redirect instead of 400.
+    for middleware in app.user_middleware:
+        if middleware.kwargs.get("dispatch") is host_header_middleware:
+            app.user_middleware.remove(middleware)
+            app.user_middleware.insert(0, middleware)
+            app.middleware_stack = app.build_middleware_stack()
+            break
 
     # ── Start uvicorn with direct Server API ─────────────────────────
     # We use uvicorn.Server directly (not uvicorn.run) so we can split

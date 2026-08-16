@@ -10,6 +10,7 @@ integration (install on join, play routing, ack) is tested with the standard
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,9 +64,20 @@ class TestVoiceMixerCore:
         assert max(peaks) < int(32767 * 0.5)
 
 
-# =====================================================================
-# Adapter integration
-# =====================================================================
+
+
+def test_adapter_voice_binding_predicate_requires_matching_connected_vc():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter._voice_text_channels = {42: 123}
+    adapter._voice_clients = {42: SimpleNamespace(is_connected=lambda: True)}
+    assert adapter.is_voice_bound_to_chat("123") is True
+    assert adapter.is_voice_bound_to_chat("999") is False
+
+    adapter._voice_clients[42].is_connected = lambda: False
+    assert adapter.is_voice_bound_to_chat("123") is False
+
 
 def _make_adapter(fx_cfg=None):
     from plugins.platforms.discord.adapter import DiscordAdapter

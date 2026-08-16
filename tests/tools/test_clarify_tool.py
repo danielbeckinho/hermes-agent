@@ -87,6 +87,36 @@ class TestClarifyToolCallbackHandling:
         result = json.loads(clarify_tool("Q?", callback=mock_callback))
         assert result["user_response"] == "response with spaces"
 
+    def test_context_reaches_context_aware_callback(self):
+        """Optional context should be forwarded to callbacks that accept it."""
+        seen = {}
+
+        def callback(question, choices, *, context=""):
+            seen.update(question=question, choices=choices, context=context)
+            return "A"
+
+        clarify_tool(
+            "Choose the next action?",
+            choices=["A", "B"],
+            context="Why this is needed; comparison; recommendation.",
+            callback=callback,
+        )
+
+        assert seen["context"] == "Why this is needed; comparison; recommendation."
+
+    def test_context_omitted_for_legacy_callback(self):
+        """Legacy 2-arg callbacks must not receive context as a positional arg."""
+        def legacy_callback(question, choices):
+            return "A"
+
+        result = json.loads(clarify_tool(
+            "Choose?",
+            choices=["A", "B"],
+            context="some brief",
+            callback=legacy_callback,
+        ))
+        assert result["user_response"] == "A"
+
 
 class TestCheckClarifyRequirements:
     """Tests for the requirements check function."""

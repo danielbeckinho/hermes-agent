@@ -234,6 +234,41 @@ class TestDiscordSendClarify:
         assert len(kwargs["view"].children) == 4
 
     @pytest.mark.asyncio
+    async def test_multi_choice_speaks_after_posting(self):
+        adapter = _make_adapter()
+        channel = MagicMock()
+        sent_msg = MagicMock(id=123456)
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        adapter._speak_bound_clarify = AsyncMock()
+
+        await adapter.send_clarify("9001", "Choose A or B", ["A", "B"], "cidV", "sk-V")
+
+        channel.send.assert_awaited_once()
+        adapter._speak_bound_clarify.assert_awaited_once_with("9001", "Choose A or B")
+
+    @pytest.mark.asyncio
+    async def test_bound_voice_speaks_decision_marked_summary(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.is_voice_bound_to_chat = MagicMock(return_value=True)
+        adapter.play_tts = AsyncMock()
+        spoken = []
+
+        from tools import tts_tool
+
+        def fake_tts(*, text, output_path):
+            spoken.append(text)
+            Path(output_path).write_bytes(b"audio")
+            return '{"success": true, "file_path": "' + output_path + '"}'
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+        await adapter._speak_bound_clarify("9001", "Choose A or B")
+
+        adapter.play_tts.assert_awaited_once()
+        assert spoken == ["Decision needed. Choose A or B"]
+        assert not Path(adapter.play_tts.call_args.args[1]).exists()
+
+    @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
         adapter = _make_adapter()
         channel = MagicMock()

@@ -4603,6 +4603,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
+    def is_voice_bound_to_chat(self, chat_id: str) -> bool:
+        """Return whether an existing connected VC is bound to this text chat."""
+        for guild_id, text_channel_id in self._voice_text_channels.items():
+            if str(text_channel_id) == str(chat_id) and self.is_in_voice_channel(guild_id):
+                return True
+        return False
+
     def is_in_voice_channel(self, guild_id: int) -> bool:
         """Check if the bot is connected to a voice channel in this guild."""
         vc = self._voice_clients.get(guild_id)
@@ -7396,6 +7403,37 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def _speak_bound_clarify(self, chat_id: str, question: str) -> None:
+        """Best-effort spoken decision cue for an already-bound Discord VC."""
+        audio_path = actual_path = None
+        try:
+            if not self.is_voice_bound_to_chat(chat_id):
+                return
+            from gateway.config import Platform
+            from gateway.platforms.base import build_auto_tts_output_path
+            from tools.tts_text_normalize import prepare_spoken_text
+            from tools.tts_tool import text_to_speech_tool
+
+            spoken = prepare_spoken_text(f"Decision needed. {question}", max_chars=600)
+            if not spoken:
+                return
+            audio_path = build_auto_tts_output_path(Platform.DISCORD)
+            result = json.loads(await asyncio.to_thread(
+                text_to_speech_tool, text=spoken, output_path=audio_path,
+            ))
+            actual_path = result.get("file_path", audio_path)
+            if result.get("success") and os.path.isfile(actual_path):
+                await self.play_tts(chat_id, actual_path)
+        except Exception:
+            logger.debug("[%s] clarify VC cue failed", self.name, exc_info=True)
+        finally:
+            for path in {audio_path, actual_path}:
+                if path and os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -7518,6 +7556,7 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
+            await self._speak_bound_clarify(chat_id, str(question or ""))
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
