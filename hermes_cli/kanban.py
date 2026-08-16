@@ -772,7 +772,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("--chat-id", required=True)
     p_nsub.add_argument("--chat-type", default="", help="dm / group / channel (used by wake routing)")
     p_nsub.add_argument("--thread-id", default=None)
-    p_nsub.add_argument("--voice", action="store_true", help="Also speak Discord lifecycle notices while the bot is VC-bound to this chat")
     p_nsub.add_argument("--user-id", default=None)
     p_nsub.add_argument(
         "--voice",
@@ -2771,7 +2770,6 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
             notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata,
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"

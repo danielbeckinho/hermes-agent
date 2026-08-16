@@ -5,6 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 
 ./scripts/run_tests.sh \
+  tests/agent/test_i18n.py \
   tests/hermes_cli/test_kanban_notify.py \
   tests/gateway/test_kanban_notifier.py \
   tests/gateway/test_discord_voice_mixer.py \

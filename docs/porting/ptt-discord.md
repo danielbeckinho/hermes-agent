@@ -20,4 +20,4 @@ Port the named producer and consumer together. Do not copy an entire page or wat
 ./scripts/verify-ptt-discord-port.sh
 ```
 
-It runs only these focused PTT and Discord-notice checks, builds the browser bundle, and rejects whitespace errors. It does not deploy, connect Discord, or join a voice channel.
+It runs the locale parity/placeholder guard, focused PTT and Discord-notice checks, builds the browser bundle, and rejects whitespace errors. It does not deploy, connect Discord, or join a voice channel.
