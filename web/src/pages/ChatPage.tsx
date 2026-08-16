@@ -42,12 +42,14 @@ import { useI18n } from "@/i18n";
 import { api, fetchJSON } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
   PTY_RESUME_RECONNECT_THROTTLE_MS,
   PTY_RESUME_SANITIZE_WINDOW_MS,
+  PTY_TICKET_TIMEOUT_MS,
   type PtyConnectionState,
   shouldBlockPtyInput,
   shouldReconnectPtyOnPageResume,
@@ -63,6 +65,14 @@ import {
   normalizePtyMobileInput,
   shouldTreatInputAsMobileReplacement,
 } from "@/lib/pty-mobile-input";
+import {
+  resolvePtyKeyboardShortcut,
+  sendPtyShortcutSequence,
+} from "@/lib/pty-keyboard-shortcuts";
+import {
+  isViewportPinnedToBottom,
+  shouldFollowPtyOutput,
+} from "@/lib/pty-scroll";
 import {
   imageFilesFromTransfer,
   transferMayContainImage,
@@ -171,16 +181,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const stickToBottomRef = useRef(true);
   const speechRef = useRef<HTMLAudioElement | null>(null);
-  const speechInterruptedRef = useRef(false);
   const speechGenerationRef = useRef(0);
+  // Tracks whether the turn currently in flight was triggered by a PTT
+  // capture, so the TTS reply only plays for that turn — not for turns the
+  // user typed normally. "awaiting-start" until the PTY echoes the voice
+  // marker back on `message.start`; "active" until `message.complete`.
   const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
-  // Set when a manual (auto-send off) voice capture wrote its transcript into
-  // the PTY input line without submitting. Consumed by the onData handler
-  // below: the private voice marker is injected immediately before the
-  // user's later Enter, then the ref clears. Never set for typed input, so
-  // an unrelated Enter press never inherits the marker.
-  const manualVoiceDraftPendingRef = useRef(false);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -298,6 +306,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // tabs because the dep wouldn't change on tab switch.
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
+
+  // Collapse toggle for the desktop chat side panel (model + sessions),
+  // persisted in localStorage so the choice survives reloads.
+  const [chatPanelCollapsed, setChatPanelCollapsed] = useState(
+    () => localStorage.getItem("hermes-chat-panel-collapsed") === "1",
+  );
+  const toggleChatPanel = useCallback(() => {
+    setChatPanelCollapsed((prev) => {
+      const next = !prev;
+      localStorage.setItem("hermes-chat-panel-collapsed", next ? "1" : "0");
+      return next;
+    });
+  }, []);
   const { setEnd, setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
     scope: string;
@@ -466,6 +487,91 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
+  // Voice-marked send: private-use suffix is stripped by ui-tui before
+  // prompt.submit and flips `voice_turn: true` on the request, which the
+  // gateway echoes back on message.start/message.complete (see
+  // submissionCore.ts VOICE_TURN_MARKER and tui_gateway/server.py
+  // _run_prompt_submit). That round-trip is how handleVoiceCompletion below
+  // knows the finished turn's reply should be spoken.
+  const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
+    if (!settings.timestamp || !settings.path.trim() || !text.trim()) return;
+    const savedText = text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n");
+    void fetchJSON("/api/dashboard/transcript-autosave", {
+      body: JSON.stringify({ path: settings.path, text: savedText }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }).catch(() => {});
+  }, []);
+
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend = true, autosave: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!autoSend) {
+      pendingVoiceTurnRef.current = "idle";
+      ptyInputLineRef.current = transcript;
+      ws.send(transcript);
+      return;
+    }
+    pendingVoiceTurnRef.current = "awaiting-start";
+    ws.send(`${transcript}`);
+    setTimeout(() => {
+      const current = wsRef.current;
+      if (current && current.readyState === WebSocket.OPEN) current.send("\r");
+    }, 100);
+    savePrompt(transcript, autosave);
+  }, [savePrompt]);
+
+  const handleVoiceStart = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current === "awaiting-start"
+      && typeof payload === "object"
+      && payload !== null
+      && (payload as { voice_turn?: unknown }).voice_turn === true
+    ) {
+      pendingVoiceTurnRef.current = "active";
+    }
+  }, []);
+
+  // Pause the current reply the instant the mic gesture starts (before the
+  // getUserMedia await), so playback doesn't bleed into the new recording.
+  const interruptSpeech = useCallback(() => {
+    speechRef.current?.pause();
+  }, []);
+
+  const resumeSpeech = useCallback(() => {
+    void speechRef.current?.play().catch(() => {});
+  }, []);
+
+  const handleVoiceCompletion = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current !== "active"
+      || typeof payload !== "object"
+      || payload === null
+      || (payload as { voice_turn?: unknown }).voice_turn !== true
+    ) return;
+    pendingVoiceTurnRef.current = "idle";
+    const text = String((payload as { text?: unknown }).text ?? "").trim();
+    if (!text) return;
+    const speechGeneration = ++speechGenerationRef.current;
+    void fetchJSON<{ data_url?: string }>(
+      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
+      {
+        body: JSON.stringify({ text }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ).then((response) => {
+      if (!response.data_url || speechGeneration !== speechGenerationRef.current) return;
+      speechRef.current?.pause();
+      const speech = new Audio(response.data_url);
+      speech.onended = () => {
+        if (speechRef.current === speech) speechRef.current = null;
+      };
+      speechRef.current = speech;
+      void speech.play().catch(() => {});
+    }).catch(() => {});
+  }, [scopedProfile]);
+
   const handleCopyLast = () => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -484,122 +590,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
-
-  const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
-    // Only an explicit Send + Save (PgDown) sets timestamp:true. A plain
-    // voice send passes the bare checkbox settings (no timestamp), so it
-    // must never append to the transcript file, even when enabled.
-    if (!settings.timestamp || !settings.path.trim() || !text.trim()) return;
-    const savedText = text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n");
-    void fetchJSON("/api/dashboard/transcript-autosave", {
-      body: JSON.stringify({ path: settings.path, text: savedText }),
-      headers: { "Content-Type": "application/json" },
-      method: "POST",
-    }).catch(() => {});
-  }, []);
-
-  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean, autosave: TranscriptAutosaveSettings) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // A newer capture always discards any prior unsubmitted manual draft's
-    // correlation, whether this capture is itself auto or manual.
-    manualVoiceDraftPendingRef.current = false;
-    if (autoSend) {
-      // Private-use Unicode suffix is consumed by ui-tui before prompt.submit;
-      // ordinary typed input never carries this suffix.
-      pendingVoiceTurnRef.current = "awaiting-start";
-      ws.send(`${transcript}\uE000`);
-      setTimeout(() => {
-        const current = wsRef.current;
-        if (current && current.readyState === WebSocket.OPEN) current.send("\r");
-      }, 100);
-      savePrompt(transcript, autosave);
-      return;
-    }
-    // Manual mode: drop the plain transcript into the PTY input line only.
-    // No marker, no Enter \u2014 stays editable until the user submits it
-    // themselves via the onData handler below.
-    pendingVoiceTurnRef.current = "idle";
-    manualVoiceDraftPendingRef.current = true;
-    ptyInputLineRef.current = transcript;
-    ws.send(transcript);
-  }, [savePrompt]);
-
-  const handleVoiceStart = useCallback((payload: unknown) => {
-    if (
-      pendingVoiceTurnRef.current === "awaiting-start"
-      && typeof payload === "object"
-      && payload !== null
-      && (payload as { voice_turn?: unknown }).voice_turn === true
-    ) {
-      pendingVoiceTurnRef.current = "active";
-    }
-  }, []);
-
-  const interruptSpeech = useCallback((cancel: boolean) => {
-    if (cancel) {
-      speechGenerationRef.current += 1;
-      speechInterruptedRef.current = false;
-      const speech = speechRef.current;
-      if (speech) {
-        speech.pause();
-        speech.currentTime = 0;
-      }
-      speechRef.current = null;
-      return;
-    }
-    speechInterruptedRef.current = true;
-    const speech = speechRef.current;
-    if (!speech) return;
-    speech.pause();
-  }, []);
-
-  const resumeSpeech = useCallback(() => {
-    speechInterruptedRef.current = false;
-    const speech = speechRef.current;
-    if (speech) void speech.play().catch(() => {});
-  }, []);
-
-  const handleVoiceCompletion = useCallback((payload: unknown) => {
-    if (
-      pendingVoiceTurnRef.current !== "active"
-      || typeof payload !== "object"
-      || payload === null
-      || (payload as { voice_turn?: unknown }).voice_turn !== true
-    ) return;
-    pendingVoiceTurnRef.current = "idle";
-    const text = typeof payload === "object" && payload !== null
-      ? String((payload as { text?: unknown }).text ?? "").trim()
-      : "";
-    if (!text) return;
-    const speechGeneration = speechGenerationRef.current;
-    void fetchJSON<{ data_url?: string }>(
-      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
-      {
-        body: JSON.stringify({ text }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      },
-    ).then((response) => {
-      if (!response.data_url || speechGeneration !== speechGenerationRef.current) return;
-      const priorSpeech = speechRef.current;
-      if (priorSpeech) {
-        priorSpeech.pause();
-        priorSpeech.currentTime = 0;
-      }
-      const speech = new Audio(response.data_url);
-      speech.onended = () => {
-        if (speechRef.current === speech) speechRef.current = null;
-      };
-      speechRef.current = speech;
-      if (!speechInterruptedRef.current) void speech.play().catch(() => {});
-    }).catch(() => {});
-  }, [scopedProfile]);
-
-  useEffect(() => () => {
-    pendingVoiceTurnRef.current = "idle";
-    manualVoiceDraftPendingRef.current = false;
-  }, [channel, reconnectNonce, scopedProfile]);
 
   useEffect(() => {
     // Don't spawn the chat PTY (and the TUI/agent bootstrap it triggers)
@@ -774,31 +764,60 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
 
-      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
-      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
-      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
-      // without a selection it passes through to the TUI so agents can still
-      // react to the keypress.
+      // Copy: Cmd+C on macOS, Ctrl+C or Ctrl+Shift+C elsewhere. Copy only
+      // when xterm has a selection; without one Ctrl+C still reaches the TUI
+      // as SIGINT.
       // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
+      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey;
+      // Paste on BARE Ctrl+V too (not only Ctrl+Shift+V). Bare Ctrl+V otherwise
+      // falls through to the TUI, whose server-side clipboard read can't see the
+      // browser/OS clipboard → "No image found in clipboard". Routing Ctrl+V
+      // through the same navigator.clipboard path below makes it paste
+      // image-or-text correctly, like Ctrl+Shift+V.
+      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey;
 
-      if (copyModifier && ev.key.toLowerCase() === "c") {
-        const sel = term.getSelection();
-        if (sel) {
-          // Direct writeText inside the keydown handler preserves the user
-          // gesture — async round-trips through OSC 52 can lose activation
-          // and fail with "Document is not focused".
-          navigator.clipboard.writeText(sel).catch((err) => {
-            console.warn("[dashboard clipboard] direct copy failed:", err.message);
-          });
-          // Clear xterm.js's highlight after copy (matches gnome-terminal).
-          term.clearSelection();
-          ev.preventDefault();
-          return false;
-        }
-        // No selection → fall through so the TUI receives Ctrl+Shift+C
-        // (or the bare ev if the user used a different modifier).
+      const terminalSelection = term.getSelection();
+      const shortcut = resolvePtyKeyboardShortcut(
+        ev,
+        isMac,
+        Boolean(terminalSelection),
+      );
+
+      if (
+        (shortcut === "copy" ||
+          (copyModifier && ev.shiftKey && ev.key.toLowerCase() === "c")) &&
+        terminalSelection
+      ) {
+        // Direct writeText inside the keydown handler preserves the user
+        // gesture — async round-trips through OSC 52 can lose activation
+        // and fail with "Document is not focused".
+        navigator.clipboard.writeText(terminalSelection).catch((err) => {
+          console.warn("[dashboard clipboard] direct copy failed:", err.message);
+        });
+        // Clear xterm.js's highlight after copy (matches gnome-terminal).
+        term.clearSelection();
+        ev.preventDefault();
+        return false;
+      }
+
+      // Ctrl+Backspace → delete previous word. xterm.js sends bare DEL
+      // regardless of modifier, so word-delete never reaches the TUI on its
+      // own. Send ^W (0x17), which readline / prompt_toolkit treat as
+      // delete-word-backward. (Ctrl+W can't be used in a browser tab — it's a
+      // reserved shortcut that closes the tab and preventDefault has no effect;
+      // for Ctrl+W muscle memory use the Electron desktop app.)
+      if (shortcut === "delete-word-backward") {
+        ev.preventDefault();
+        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, "\x17");
+        return false;
+      }
+
+      // Ctrl+Delete → delete next word. Mirror of Ctrl+Backspace; sends Alt+d
+      // (ESC d), the readline / prompt_toolkit kill-word-forward binding.
+      if (shortcut === "delete-word-forward") {
+        ev.preventDefault();
+        sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, "\x1bd");
+        return false;
       }
 
       if (pasteModifier && ev.key.toLowerCase() === "v") {
@@ -871,7 +890,37 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.loadAddon(new WebLinksAddon());
 
     let mobileInputCleanup: (() => void) | null = null;
+    // xterm occasionally drops committed dead-key/IME text instead of emitting
+    // onData. The compositionend event supplies the authoritative text.
+    let sendComposedText: (data: string) => void = () => undefined;
+    const compositionForwarder = createPtyCompositionForwarder((data) => {
+      sendComposedText(data);
+    });
     term.open(host);
+
+    // IME composition guard (fixes #52111).
+    //
+    // React 18's root-level event delegation intercepts keydown events with
+    // keyCode 229 (the "composition in progress" signal sent by the browser
+    // during non-Latin IME input) and synthesises an onCompositionStart
+    // event.  That synthetic path sets internal composing state that
+    // interferes with xterm.js's own IME handling on its hidden textarea,
+    // causing the first keystroke of each composition chunk to be silently
+    // dropped — most visible with Cyrillic (Ukrainian/Russian) on
+    // Firefox-based browsers, but affects any locale that uses composition
+    // events (CJK, Arabic, Hebrew).
+    //
+    // xterm.js relies on native compositionstart/compositionend on its
+    // internal textarea, not on keydown, so blocking the keyCode-229
+    // keydown from reaching React's delegation layer is safe.  The listener
+    // sits in the *capture* phase on the terminal host so it fires before
+    // the event bubbles up to the React root.
+    const _imeCompositionGuard = (e: KeyboardEvent) => {
+      if (e.keyCode === 229 || e.key === "Process") {
+        e.stopPropagation();
+      }
+    };
+    host.addEventListener("keydown", _imeCompositionGuard, true);
 
     const textarea = term.textarea;
     if (textarea) {
@@ -895,8 +944,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
         }
       };
-      const markCompositionEnd = () => {
+      const markCompositionEnd = (ev: CompositionEvent) => {
         mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
+        compositionForwarder.onCompositionEnd(ev.data);
       };
 
       textarea.addEventListener("beforeinput", markReplacementInput, true);
@@ -1033,6 +1083,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let unmounting = false;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
+    let onScrollDisposable: { dispose(): void } | null = null;
     let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
     let resumeMaxTimer: ReturnType<typeof setTimeout> | null = null;
     const clearEraseSuppressionTimer = () => {
@@ -1082,7 +1133,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         connectingTimerRef.current = null;
       }
     };
-    const scheduleReconnect = (code: number) => {
+    // The pre-socket half of the connect. A ticket request that rejects or
+    // never settles leaves no socket behind, so neither `onclose` nor the
+    // NS-591 CONNECTING timer (armed after `new WebSocket` below) can recover
+    // it. `ticketSuperseded` invalidates a late ticket result so a timed-out
+    // attempt cannot open a socket behind the replacement this schedules.
+    let ticketSuperseded = false;
+    let ticketTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearTicketTimer = () => {
+      if (ticketTimer) {
+        clearTimeout(ticketTimer);
+        ticketTimer = null;
+      }
+    };
+    // `code` is null when the attempt died before any socket existed — the
+    // banner then omits the "(code N)" suffix rather than inventing one.
+    const scheduleReconnect = (code: number | null) => {
       if (reconnectTimerRef.current) {
         return;
       }
@@ -1097,6 +1163,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         setReconnectNonce((n) => n + 1);
       }, delayMs);
     };
+    // Give up on the ticket phase and hand off to the ordinary backoff.
+    const failTicketAttempt = () => {
+      ticketSuperseded = true;
+      clearTicketTimer();
+      connectInFlightRef.current = false;
+      scheduleReconnect(null);
+    };
     void (async () => {
       if (unmounting) return;
       const params: Record<string, string> = { channel };
@@ -1110,7 +1183,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
-      const url = await api.buildWsUrl("/api/pty", params);
+
+      ticketTimer = setTimeout(() => {
+        ticketTimer = null;
+        if (unmounting || ticketSuperseded) {
+          return;
+        }
+        failTicketAttempt();
+      }, PTY_TICKET_TIMEOUT_MS);
+
+      let url: string;
+      try {
+        url = await api.buildWsUrl("/api/pty", params);
+      } catch (err) {
+        if (unmounting || ticketSuperseded) return;
+        console.warn(`[chat] PTY ticket request failed: ${err}`);
+        failTicketAttempt();
+        return;
+      }
+      if (unmounting || ticketSuperseded) return;
+      clearTicketTimer();
+
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -1149,6 +1242,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
       ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      // Resumed sessions replay scrollback over the socket. Start pinned to
+      // the bottom so the latest output is in view; released once the user
+      // scrolls up (#59591).
+      if (resumeParam) stickToBottomRef.current = true;
       // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
       // skill" panel) is typed into the composer as a /learn command once the
       // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -1195,7 +1292,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // resume frame into "" (pty-resume-sanitizer.ts); keying off raw `text`
       // would hide the wait notice while the terminal is still blank.
       const rendered = resumeParam ? sanitizer.next(text) : text;
-      term.write(rendered);
+      // Resume replay lands over many write chunks; pin the viewport to the
+      // bottom as each chunk COMMITS (xterm write callback) instead of
+      // guessing with a fixed delay, and release the pin the moment the user
+      // scrolls up to read the backlog (#59591).
+      const followScroll = shouldFollowPtyOutput(
+        resumeParam,
+        stickToBottomRef.current,
+      )
+        ? () => termRef.current?.scrollToBottom()
+        : undefined;
+      term.write(rendered, followScroll);
       noteResumePtyChunk(rendered);
     };
 
@@ -1314,7 +1421,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // behave normally.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-      onDataDisposable = term.onData((data) => {
+      const forwardPtyData = (data: string, useMobileReplacement = true) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
@@ -1335,43 +1442,39 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
-        const submittedLine = ptyInputLineRef.current;
         const normalized = normalizePtyMobileInput(
           data,
           ptyInputLineRef.current,
-          Date.now() <= mobileReplacementInputUntilRef.current,
+          useMobileReplacement && Date.now() <= mobileReplacementInputUntilRef.current,
         );
         ptyInputLineRef.current = normalized.nextLine;
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0;
         }
-        // Terminal line-cancel controls (Ctrl-U, Ctrl-C) discard the input
-        // line, so cancel any pending manual voice draft.
-        if (normalized.data.includes("\x15") || normalized.data.includes("\x03")) {
-          manualVoiceDraftPendingRef.current = false;
-        }
-        // A pending manual voice draft only gets the private marker once the
-        // user actually submits (Enter) — this is the existing xterm/PTY
-        // submission seam. Consumed once; typed/unrelated Enters with no
-        // pending draft never carry the marker.
-        if (
-          manualVoiceDraftPendingRef.current &&
-          (normalized.data.includes("\r") || normalized.data.includes("\n"))
-        ) {
-          manualVoiceDraftPendingRef.current = false;
-          pendingVoiceTurnRef.current = "awaiting-start";
-          ws.send("");
-        }
         ws.send(normalized.data);
-        if ((normalized.data.includes("\r") || normalized.data.includes("\n")) && submittedLine.trim()) {
-          savePrompt(submittedLine);
+      };
+      // The deferred composition fallback is already committed text, so it
+      // must not consume the mobile replacement window intended for xterm's
+      // normal onData path.
+      sendComposedText = (data) => forwardPtyData(data, false);
+      onDataDisposable = term.onData((data) => {
+        if (!SGR_MOUSE_RE.test(data)) {
+          compositionForwarder.noteTerminalData(data);
         }
+        forwardPtyData(data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
+      });
+
+      // Release the stick-to-bottom pin the moment the user scrolls up, so
+      // we only auto-follow during the resume replay — not their manual
+      // review of the backlog (#59591).
+      onScrollDisposable = term.onScroll(() => {
+        stickToBottomRef.current = isViewportPinnedToBottom(term.buffer.active);
       });
     })();
 
@@ -1386,7 +1489,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setResumeHydrating(false);
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
+      onScrollDisposable?.dispose();
       mobileInputCleanup?.();
+      compositionForwarder.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
@@ -1402,6 +1507,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
       clearReconnectTimer();
       clearConnectingTimer();
+      clearTicketTimer();
+      ticketSuperseded = true;
       connectInFlightRef.current = false;
       // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
       // ticket fetch makes the open async). The cleanup runs at the outer
@@ -1410,6 +1517,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // the ticket fetch resolves and ``wsRef.current`` was never assigned.
       wsRef.current?.close();
       wsRef.current = null;
+      host.removeEventListener("keydown", _imeCompositionGuard, true);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -1634,9 +1742,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onSessionTitleChange={handleSessionTitleChange}
                 onMessageStart={handleVoiceStart}
                 onMessageComplete={handleVoiceCompletion}
-                onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
             <ChatSessionList
@@ -1677,10 +1785,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+
           <PushToTalkButton
-            onGestureEnd={resumeSpeech}
-            onGestureStart={interruptSpeech}
             onTranscript={handleVoiceTranscript}
+            onGestureStart={interruptSpeech}
+            onGestureEnd={resumeSpeech}
             profile={scopedProfile}
           />
 
@@ -1760,24 +1869,62 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               </span>
             </span>
           </Button>
+
+          {chatPanelCollapsed && (
+            <Button
+              ghost
+              onClick={toggleChatPanel}
+              title="Show side panel (model + sessions)"
+              aria-label="Show chat side panel"
+              className={cn(
+                "absolute z-10",
+                "normal-case tracking-normal font-normal",
+                "rounded border border-current/30",
+                "bg-black/20",
+                "opacity-70 hover:opacity-100 hover:border-current/60",
+                "transition-opacity duration-150",
+                "top-2 right-2 px-2 py-1 text-xs sm:top-3 sm:right-3",
+              )}
+              style={{ color: terminalFg }}
+            >
+              <span className="inline-flex items-center gap-1">
+                <PanelRight className="h-3 w-3 shrink-0" />
+                <span className="hidden min-[400px]:inline tracking-wide">
+                  panel
+                </span>
+              </span>
+            </Button>
+          )}
         </div>
 
-        {!narrow && (
+        {!narrow && !chatPanelCollapsed && (
           <div
             id="chat-side-panel"
             role="complementary"
             aria-label={modelToolsLabel}
             className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
           >
+            <div className="flex h-8 shrink-0 items-center justify-end pr-1">
+              <Button
+                ghost
+                size="icon"
+                onClick={toggleChatPanel}
+                aria-label="Collapse chat side panel"
+                title="Collapse side panel"
+                className="text-text-secondary hover:text-midground"
+              >
+                <X />
+              </Button>
+            </div>
             {/* Model picker — keeps the rail thin. */}
             <div className="shrink-0">
               <ChatSidebar
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onSessionTitleChange={handleSessionTitleChange}
                 onMessageStart={handleVoiceStart}
                 onMessageComplete={handleVoiceCompletion}
-                onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
 

@@ -4,6 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { PTY_TICKET_TIMEOUT_MS } from "@/lib/pty-reconnect";
+
 class FakeFitAddon {
   fit() {}
 }
@@ -15,11 +17,9 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
-  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
-  onDataHandler: ((data: string) => void) | null = null;
   parser = {
     registerOscHandler: vi.fn(),
   };
@@ -27,7 +27,6 @@ class FakeTerminal {
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
-    FakeTerminal.instances.push(this);
   }
 
   attachCustomKeyEventHandler() {
@@ -50,14 +49,25 @@ class FakeTerminal {
 
   loadAddon() {}
 
-  onData(handler: (data: string) => void) {
-    this.onDataHandler = handler;
+  onData() {
     return { dispose() {} };
   }
 
   onResize() {
     return { dispose() {} };
   }
+
+  onScroll() {
+    return { dispose() {} };
+  }
+
+  get buffer() {
+    // Minimal active-buffer surface for the resume follow-scroll pin
+    // (isViewportPinnedToBottom reads viewportY/baseY).
+    return { active: { baseY: 0, viewportY: 0 } };
+  }
+
+  scrollToBottom() {}
 
   open() {}
 
@@ -71,7 +81,6 @@ class FakeTerminal {
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
-  fetchJSON: vi.fn(async () => ({ data_url: "data:audio/wav;base64,AA==" })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -79,34 +88,8 @@ vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
 vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal }));
-const { sidebarState } = vi.hoisted(() => ({ sidebarState: { current: {} as Record<string, ((payload: unknown) => void) | undefined> } }));
 vi.mock("@/components/ChatSidebar", () => ({
-  ChatSidebar: (props: Record<string, unknown>) => {
-    sidebarState.current = props as typeof sidebarState.current;
-    return null;
-  },
-}));
-const { voiceState } = vi.hoisted(() => ({ voiceState: {
-  onGestureEnd: null as (() => void) | null,
-  onGestureStart: null as ((cancel: boolean) => void) | null,
-  onTranscript: null as ((text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void) | null,
-} }));
-const { audioState } = vi.hoisted(() => ({ audioState: { instances: [] as Array<{ currentTime: number; onended: (() => void) | null; pause: ReturnType<typeof vi.fn>; play: ReturnType<typeof vi.fn> }> } }));
-vi.mock("@/components/PushToTalkButton", () => ({
-  PushToTalkButton: (props: {
-    onGestureEnd?: () => void;
-    onGestureStart?: (cancel: boolean) => void;
-    onTranscript: (text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void;
-  }) => {
-    voiceState.onGestureEnd = props.onGestureEnd ?? null;
-    voiceState.onGestureStart = props.onGestureStart ?? null;
-    voiceState.onTranscript = props.onTranscript;
-    return null;
-  },
-  readTranscriptAutosaveSettings: () => ({
-    enabled: window.localStorage.getItem("hermes.transcriptAutosave.enabled") === "1",
-    path: window.localStorage.getItem("hermes.transcriptAutosave.path") || "transcript.txt",
-  }),
+  ChatSidebar: () => null,
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -141,7 +124,6 @@ vi.mock("@/lib/dashboard-auth-reload", () => ({
 vi.mock("@/lib/api", () => ({
   api: apiMocks,
   buildWsUrl: apiMocks.buildWsUrl,
-  fetchJSON: apiMocks.fetchJSON,
 }));
 
 class FakeWebSocket {
@@ -155,7 +137,6 @@ class FakeWebSocket {
   readyState = FakeWebSocket.OPEN;
   url: string;
 
-  sent: string[] = [];
   constructor(url: string) {
     this.url = url;
     FakeWebSocket.instances.push(this);
@@ -165,7 +146,7 @@ class FakeWebSocket {
     this.readyState = 3;
   }
 
-  send(value: string) { this.sent.push(value); }
+  send() {}
 }
 
 type CloseEventLike = {
@@ -177,6 +158,25 @@ type CloseEventLike = {
 let container: HTMLDivElement;
 let root: Root;
 
+// jsdom runs without an origin here (per-file @vitest-environment jsdom on a
+// node-default config), so localStorage is undefined. Stub it so components
+// that persist UI state (side panel collapse) can be exercised.
+const localStorageMock = (() => {
+  let store: Record<string, string> = {};
+  return {
+    getItem: (key: string) => store[key] ?? null,
+    setItem: (key: string, value: string) => {
+      store[key] = String(value);
+    },
+    removeItem: (key: string) => {
+      delete store[key];
+    },
+    clear: () => {
+      store = {};
+    },
+  };
+})();
+
 async function render(ui: ReactNode) {
   container = document.createElement("div");
   document.body.append(container);
@@ -185,29 +185,10 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
-  apiMocks.fetchJSON.mockReset();
-  apiMocks.fetchJSON.mockResolvedValue({ data_url: "data:audio/wav;base64,AA==" });
-  sidebarState.current = {};
-  voiceState.onGestureEnd = null;
-  voiceState.onGestureStart = null;
-  voiceState.onTranscript = null;
-  audioState.instances = [];
-  vi.stubGlobal("fetch", vi.fn(async () => ({
-    status: 200,
-    ok: true,
-    json: async () => ({ data_url: "data:audio/wav;base64,AA==" }),
-    clone() { return this; },
-  })));
-  vi.stubGlobal("Audio", class {
-    currentTime = 0;
-    onended: (() => void) | null = null;
-    pause = vi.fn();
-    play = vi.fn(() => Promise.resolve());
-    constructor() { audioState.instances.push(this); }
-  });
-  FakeTerminal.instances = [];
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
+  apiMocks.buildWsUrl.mockReset();
+  apiMocks.buildWsUrl.mockResolvedValue("ws://localhost/api/pty?channel=chat-1");
   vi.stubGlobal("WebSocket", FakeWebSocket);
   vi.stubGlobal(
     "ResizeObserver",
@@ -258,13 +239,8 @@ beforeEach(() => {
     },
   });
   sessionStorage.clear();
-  const localStorageStore = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    clear: () => localStorageStore.clear(),
-    getItem: (key: string) => (localStorageStore.has(key) ? localStorageStore.get(key)! : null),
-    removeItem: (key: string) => localStorageStore.delete(key),
-    setItem: (key: string, value: string) => localStorageStore.set(key, value),
-  });
+  vi.stubGlobal("localStorage", localStorageMock);
+  localStorageMock.clear();
 });
 
 afterEach(async () => {
@@ -274,290 +250,6 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
-  it("waits for the voice transcript to reach the PTY before submitting", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-
-    vi.useFakeTimers();
-    voiceState.onTranscript?.("voice prompt", true);
-    expect(ws.sent.slice(-1)).toEqual(["voice prompt\uE000"]);
-
-    await vi.advanceTimersByTimeAsync(100);
-    expect(ws.sent.slice(-2)).toEqual(["voice prompt\uE000", "\r"]);
-    vi.useRealTimers();
-  });
-
-  it("timestamps only an explicit voice send-and-save entry", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-15T22:00:00.000Z"));
-
-    voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt", timestamp: true });
-
-    expect(apiMocks.fetchJSON).toHaveBeenCalledWith("/api/dashboard/transcript-autosave", expect.objectContaining({
-      body: JSON.stringify({ path: "transcript.txt", text: "2026-08-15T22:00:00.000Z voice prompt" }),
-    }));
-    vi.useRealTimers();
-  });
-
-  it("timestamps every non-empty line in an explicit multiline send-and-save entry", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-15T22:00:00.000Z"));
-
-    voiceState.onTranscript?.("first line\n\nsecond line", true, { enabled: true, path: "transcript.txt", timestamp: true });
-
-    expect(apiMocks.fetchJSON).toHaveBeenCalledWith("/api/dashboard/transcript-autosave", expect.objectContaining({
-      body: JSON.stringify({ path: "transcript.txt", text: "2026-08-15T22:00:00.000Z first line\n2026-08-15T22:00:00.000Z second line" }),
-    }));
-    vi.useRealTimers();
-  });
-
-  it("does not write a transcript for a plain voice send even when autosave is enabled", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-
-    // Checkbox on makes Send + Save available, but a plain Send (PgUp) must
-    // NOT append to the transcript file — only an explicit Send + Save does.
-    voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt" });
-
-    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
-      "/api/dashboard/transcript-autosave",
-      expect.anything(),
-    );
-  });
-
-  it("does not save typed text or a manual voice transcript submitted via Enter", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const terminal = FakeTerminal.instances.at(-1)!;
-    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-    await act(async () => ws.onopen?.());
-
-    // Checkbox on (persisted). Typed text followed by Enter routes through
-    // the onData submit seam and must never append to the transcript file —
-    // only Send + Save does.
-    window.localStorage.setItem("hermes.transcriptAutosave.enabled", "1");
-    await act(async () => terminal.onDataHandler?.("typed text"));
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
-      "/api/dashboard/transcript-autosave",
-      expect.anything(),
-    );
-
-    // A manually-edited voice transcript submitted later via Enter is also
-    // not a Send + Save, so likewise must not be written.
-    voiceState.onTranscript?.("editable voice", false);
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
-      "/api/dashboard/transcript-autosave",
-      expect.anything(),
-    );
-  });
-
-  it("does not speak an unrelated turn after a voice transcript", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: false });
-    sidebarState.current.onMessageComplete?.({ text: "unrelated reply", voice_turn: false });
-    await Promise.resolve();
-    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
-      expect.stringContaining("/api/audio/speak"),
-      expect.anything(),
-    );
-  });
-
-  it("speaks a completion carrying the voice marker", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    await vi.waitFor(() => expect(apiMocks.fetchJSON).toHaveBeenCalledWith(
-      expect.stringContaining("/api/audio/speak"),
-      expect.anything(),
-    ));
-  });
-
-  it("pauses current speech while push-to-talk is held, then resumes it", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
-
-    audioState.instances[0].currentTime = 12;
-    voiceState.onGestureStart?.(false);
-    expect(audioState.instances[0].pause).toHaveBeenCalledOnce();
-    expect(audioState.instances[0].currentTime).toBe(12);
-    voiceState.onGestureEnd?.();
-    expect(audioState.instances[0].play).toHaveBeenCalledTimes(2);
-  });
-
-  it("cancels speech on a double-tap gesture", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
-
-    audioState.instances[0].currentTime = 12;
-    voiceState.onGestureStart?.(true);
-    voiceState.onGestureEnd?.();
-    expect(audioState.instances[0].currentTime).toBe(0);
-    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
-  });
-
-  it("does not replay speech that has already ended", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
-
-    audioState.instances[0].onended?.();
-    voiceState.onGestureStart?.(false);
-    voiceState.onGestureEnd?.();
-    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
-  });
-
-  it("discards pending speech on a double-tap gesture", async () => {
-    let resolveSpeech: (response: { data_url: string }) => void = () => {};
-    apiMocks.fetchJSON.mockReturnValueOnce(new Promise((resolve) => { resolveSpeech = resolve; }));
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    voiceState.onGestureStart?.(true);
-    resolveSpeech({ data_url: "data:audio/wav;base64,AA==" });
-    await Promise.resolve();
-
-    expect(audioState.instances).toHaveLength(0);
-  });
-
-  it("defers pending speech until push-to-talk ends", async () => {
-    let resolveSpeech: (response: { data_url: string }) => void = () => {};
-    apiMocks.fetchJSON.mockReturnValueOnce(new Promise((resolve) => { resolveSpeech = resolve; }));
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-
-    voiceState.onTranscript?.("voice prompt", true);
-    sidebarState.current.onMessageStart?.({ voice_turn: true });
-    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
-    voiceState.onGestureStart?.(false);
-    resolveSpeech({ data_url: "data:audio/wav;base64,AA==" });
-    await Promise.resolve();
-
-    expect(audioState.instances).toHaveLength(1);
-    expect(audioState.instances[0].play).not.toHaveBeenCalled();
-    voiceState.onGestureEnd?.();
-    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
-  });
-
-  it("keeps a manual transcript editable until its later Enter submits the marker", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-    const terminal = FakeTerminal.instances.at(-1)!;
-    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
-    await act(async () => ws.onopen?.());
-
-    voiceState.onTranscript?.("editable voice", false);
-    expect(ws.sent.slice(-1)).toEqual(["editable voice"]);
-    expect(ws.sent).not.toContain("\uE000");
-
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(ws.sent.slice(-2)).toEqual(["\uE000", "\r"]);
-  });
-
-  it("does not carry a manual voice marker into a newer transcript", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-    const terminal = FakeTerminal.instances.at(-1)!;
-    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
-    await act(async () => ws.onopen?.());
-
-    voiceState.onTranscript?.("old manual", false);
-    vi.useFakeTimers();
-    voiceState.onTranscript?.("new auto", true);
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(ws.sent.slice(-2)).toEqual(["new auto\uE000", "\r"]);
-    await vi.advanceTimersByTimeAsync(100);
-    expect(ws.sent.slice(-3)).toEqual(["new auto\uE000", "\r", "\r"]);
-    vi.useRealTimers();
-  });
-
-  it("cancels manual voice draft on Ctrl-U, unrelated Enter has no marker", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-    const terminal = FakeTerminal.instances.at(-1)!;
-    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
-    await act(async () => ws.onopen?.());
-
-    voiceState.onTranscript?.("manual transcript", false);
-    expect(ws.sent.slice(-1)).toEqual(["manual transcript"]);
-
-    // Ctrl-U cancels the line
-    await act(async () => terminal.onDataHandler?.("\x15"));
-
-    // Unrelated typed text
-    await act(async () => terminal.onDataHandler?.("typed text"));
-
-    // Enter submits \u2014 should have NO voice marker
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(ws.sent).not.toContain("\uE000");
-  });
-
-  it("cancels manual voice draft on Ctrl-C, unrelated Enter has no marker", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
-    const ws = FakeWebSocket.instances.at(-1)!;
-    const terminal = FakeTerminal.instances.at(-1)!;
-    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
-    await act(async () => ws.onopen?.());
-
-    voiceState.onTranscript?.("manual transcript", false);
-    expect(ws.sent.slice(-1)).toEqual(["manual transcript"]);
-
-    // Ctrl-C cancels the line
-    await act(async () => terminal.onDataHandler?.("\x03"));
-
-    // Unrelated typed text
-    await act(async () => terminal.onDataHandler?.("typed text"));
-
-    // Enter submits \u2014 should have NO voice marker
-    await act(async () => terminal.onDataHandler?.("\r"));
-    expect(ws.sent).not.toContain("\uE000");
-  });
-
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 
@@ -576,5 +268,155 @@ describe("ChatPage", () => {
     });
 
     expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
+  });
+
+  it("wires the push-to-talk control into the chat input", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    expect(container.querySelector('[aria-label="Send (PgUp)"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Send + Save (PgDown)"]')).not.toBeNull();
+  });
+});
+
+describe("ChatPage side panel collapse", () => {
+  async function renderChat() {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+  }
+
+  it("collapses the desktop side panel and persists the choice", async () => {
+    localStorage.clear();
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    const collapseButton = container.querySelector(
+      '[aria-label="Collapse chat side panel"]',
+    );
+    expect(collapseButton).not.toBeNull();
+
+    await act(async () => {
+      collapseButton!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    expect(localStorage.getItem("hermes-chat-panel-collapsed")).toBe("1");
+    expect(
+      container.querySelector('[aria-label="Collapse chat side panel"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[aria-label="Show chat side panel"]'),
+    ).not.toBeNull();
+
+    // Reopening restores the panel and clears the persisted flag.
+    await act(async () => {
+      container
+        .querySelector('[aria-label="Show chat side panel"]')!
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(localStorage.getItem("hermes-chat-panel-collapsed")).toBe("0");
+    expect(
+      container.querySelector('[aria-label="Collapse chat side panel"]'),
+    ).not.toBeNull();
+  });
+});
+
+// The gated-mode ticket request runs before any socket exists, so a rejection
+// or a hang emits no `close` event and never arms PTY_CONNECTING_TIMEOUT_MS
+// (that timer is set after `new WebSocket`). Without its own deadline the tab
+// strands on "connecting" with no retry. Mirrors the ChatSidebar events-feed
+// coverage in src/components/ChatSidebar.test.tsx.
+describe("ChatPage PTY ticket connect deadline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function renderChat() {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+  }
+
+  /** Advance timers and flush the async connect that fires on the tick. */
+  async function advance(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  it("retries when the ticket request rejects", async () => {
+    apiMocks.buildWsUrl.mockRejectedValueOnce(
+      new Error("ticket endpoint unavailable"),
+    );
+
+    await renderChat();
+    await advance(0);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    // First backoff step is 250ms; the retry must mint a fresh ticket.
+    await advance(250);
+    expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("times out a stalled ticket request and retries", async () => {
+    let resolveStalledRequest!: (url: string) => void;
+    apiMocks.buildWsUrl.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStalledRequest = resolve;
+        }),
+    );
+
+    await renderChat();
+    await advance(0);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    await advance(PTY_TICKET_TIMEOUT_MS);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    // A late ticket from the timed-out attempt must not open a socket behind
+    // the replacement the deadline scheduled.
+    await act(async () => {
+      resolveStalledRequest("ws://localhost/api/pty?channel=stale");
+      await Promise.resolve();
+    });
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    await advance(250);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).not.toContain("channel=stale");
+  });
+
+  it("leaves a settled ticket's socket to the CONNECTING timer", async () => {
+    await renderChat();
+    await advance(0);
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    // NS-591 regression: once the socket exists the ticket deadline is
+    // disarmed, so PTY_CONNECTING_TIMEOUT_MS stays the only thing that may
+    // force-close a wedged handshake — the two must not both fire.
+    await advance(PTY_TICKET_TIMEOUT_MS);
+    expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
   });
 });

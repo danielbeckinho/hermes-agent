@@ -236,7 +236,7 @@ describe("PushToTalkButton", () => {
     await vi.waitFor(() => expect(stream.track.stop).toHaveBeenCalled());
   });
 
-  it("skips empty blobs and transcription rejection", async () => {
+  it("skips empty blobs and shows a retryable error after transcription rejection", async () => {
     const onTranscript = await render();
     await startRecording();
     const recorder = FakeRecorder.instances[0];
@@ -248,7 +248,7 @@ describe("PushToTalkButton", () => {
     await startRecording(2);
     FakeRecorder.instances[1].emit(new Blob(["audio"]));
     await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
-    await Promise.resolve();
+    await vi.waitFor(() => expect(button().getAttribute("aria-label")).toBe("Microphone error. Press to retry"));
     expect(onTranscript).not.toHaveBeenCalled();
   });
 
