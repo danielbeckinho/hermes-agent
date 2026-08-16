@@ -212,7 +212,8 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
 
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
-    assert tid in message
+    assert "approval" in message
+    assert tid not in message
     assert "blocked" in message
 
 
@@ -259,7 +260,8 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [delivery["chat_id"] for delivery in adapter.sent] == ["writer-chat"]
-    assert owned_tid in adapter.sent[0]["text"]
+    assert "writer-owned" in adapter.sent[0]["text"]
+    assert owned_tid not in adapter.sent[0]["text"]
     assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
 
 
@@ -309,7 +311,8 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
         winner_runner._kanban_dispatcher_lock_handle = winner_handle
         asyncio.run(_run_one_notifier_tick(monkeypatch, winner_runner))
         assert [item["chat_id"] for item in winner_adapter.sent] == ["legacy-chat"]
-        assert task_id in winner_adapter.sent[0]["text"]
+        assert "legacy" in winner_adapter.sent[0]["text"]
+        assert task_id not in winner_adapter.sent[0]["text"]
     finally:
         _release_singleton_lock(loser_handle)
         _release_singleton_lock(winner_handle)
@@ -515,7 +518,8 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
 
     # The good task must still be delivered despite the bad task failing.
     assert len(adapter.sent) == 1
-    assert tid_good in adapter.sent[0]["text"]
+    assert "good task" in adapter.sent[0]["text"]
+    assert tid_good not in adapter.sent[0]["text"]
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
@@ -553,7 +557,8 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
     text = adapter.sent[0]["text"]
     assert "TRIAGE" in text
-    assert tid in text
+    assert "loops forever" in text
+    assert tid not in text
     assert "needs credentials" in text
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
@@ -640,7 +645,8 @@ def test_lifecycle_routes_needs_input_to_decisions(tmp_path, monkeypatch):
     assert len(decision_msgs) == 1, (
         f"expected exactly one decision brief, got {len(decision_msgs)}"
     )
-    assert tid in decision_msgs[0]["text"]
+    assert "needs a call" in decision_msgs[0]["text"]
+    assert tid not in decision_msgs[0]["text"]
     assert "pick a path" in decision_msgs[0]["text"]
 
 
