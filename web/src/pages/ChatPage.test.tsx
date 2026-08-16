@@ -86,13 +86,27 @@ vi.mock("@/components/ChatSidebar", () => ({
     return null;
   },
 }));
-const { voiceState } = vi.hoisted(() => ({ voiceState: { onTranscript: null as ((text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void) | null } }));
+const { voiceState } = vi.hoisted(() => ({ voiceState: {
+  onGestureEnd: null as (() => void) | null,
+  onGestureStart: null as ((cancel: boolean) => void) | null,
+  onTranscript: null as ((text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void) | null,
+} }));
+const { audioState } = vi.hoisted(() => ({ audioState: { instances: [] as Array<{ currentTime: number; onended: (() => void) | null; pause: ReturnType<typeof vi.fn>; play: ReturnType<typeof vi.fn> }> } }));
 vi.mock("@/components/PushToTalkButton", () => ({
-  PushToTalkButton: (props: { onTranscript: (text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void }) => {
+  PushToTalkButton: (props: {
+    onGestureEnd?: () => void;
+    onGestureStart?: (cancel: boolean) => void;
+    onTranscript: (text: string, autoSend: boolean, autosave?: { enabled: boolean; path: string; timestamp?: boolean }) => void;
+  }) => {
+    voiceState.onGestureEnd = props.onGestureEnd ?? null;
+    voiceState.onGestureStart = props.onGestureStart ?? null;
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
-  readTranscriptAutosaveSettings: () => ({ enabled: false, path: "transcript.txt" }),
+  readTranscriptAutosaveSettings: () => ({
+    enabled: window.localStorage.getItem("hermes.transcriptAutosave.enabled") === "1",
+    path: window.localStorage.getItem("hermes.transcriptAutosave.path") || "transcript.txt",
+  }),
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -174,14 +188,23 @@ beforeEach(() => {
   apiMocks.fetchJSON.mockReset();
   apiMocks.fetchJSON.mockResolvedValue({ data_url: "data:audio/wav;base64,AA==" });
   sidebarState.current = {};
+  voiceState.onGestureEnd = null;
+  voiceState.onGestureStart = null;
   voiceState.onTranscript = null;
+  audioState.instances = [];
   vi.stubGlobal("fetch", vi.fn(async () => ({
     status: 200,
     ok: true,
     json: async () => ({ data_url: "data:audio/wav;base64,AA==" }),
     clone() { return this; },
   })));
-  vi.stubGlobal("Audio", class { play() { return Promise.resolve(); } });
+  vi.stubGlobal("Audio", class {
+    currentTime = 0;
+    onended: (() => void) | null = null;
+    pause = vi.fn();
+    play = vi.fn(() => Promise.resolve());
+    constructor() { audioState.instances.push(this); }
+  });
   FakeTerminal.instances = [];
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
@@ -235,6 +258,13 @@ beforeEach(() => {
     },
   });
   sessionStorage.clear();
+  const localStorageStore = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    clear: () => localStorageStore.clear(),
+    getItem: (key: string) => (localStorageStore.has(key) ? localStorageStore.get(key)! : null),
+    removeItem: (key: string) => localStorageStore.delete(key),
+    setItem: (key: string, value: string) => localStorageStore.set(key, value),
+  });
 });
 
 afterEach(async () => {
@@ -289,6 +319,51 @@ describe("ChatPage", () => {
     vi.useRealTimers();
   });
 
+  it("does not write a transcript for a plain voice send even when autosave is enabled", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+
+    // Checkbox on makes Send + Save available, but a plain Send (PgUp) must
+    // NOT append to the transcript file — only an explicit Send + Save does.
+    voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt" });
+
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+  });
+
+  it("does not save typed text or a manual voice transcript submitted via Enter", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    await act(async () => ws.onopen?.());
+
+    // Checkbox on (persisted). Typed text followed by Enter routes through
+    // the onData submit seam and must never append to the transcript file —
+    // only Send + Save does.
+    window.localStorage.setItem("hermes.transcriptAutosave.enabled", "1");
+    await act(async () => terminal.onDataHandler?.("typed text"));
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+
+    // A manually-edited voice transcript submitted later via Enter is also
+    // not a Send + Save, so likewise must not be written.
+    voiceState.onTranscript?.("editable voice", false);
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+  });
+
   it("does not speak an unrelated turn after a voice transcript", async () => {
     const { default: ChatPage } = await import("./ChatPage");
     await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
@@ -314,6 +389,91 @@ describe("ChatPage", () => {
       expect.stringContaining("/api/audio/speak"),
       expect.anything(),
     ));
+  });
+
+  it("pauses current speech while push-to-talk is held, then resumes it", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+
+    voiceState.onTranscript?.("voice prompt", true);
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
+
+    audioState.instances[0].currentTime = 12;
+    voiceState.onGestureStart?.(false);
+    expect(audioState.instances[0].pause).toHaveBeenCalledOnce();
+    expect(audioState.instances[0].currentTime).toBe(12);
+    voiceState.onGestureEnd?.();
+    expect(audioState.instances[0].play).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels speech on a double-tap gesture", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt", true);
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
+
+    audioState.instances[0].currentTime = 12;
+    voiceState.onGestureStart?.(true);
+    voiceState.onGestureEnd?.();
+    expect(audioState.instances[0].currentTime).toBe(0);
+    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
+  });
+
+  it("does not replay speech that has already ended", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt", true);
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    await vi.waitFor(() => expect(audioState.instances).toHaveLength(1));
+
+    audioState.instances[0].onended?.();
+    voiceState.onGestureStart?.(false);
+    voiceState.onGestureEnd?.();
+    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
+  });
+
+  it("discards pending speech on a double-tap gesture", async () => {
+    let resolveSpeech: (response: { data_url: string }) => void = () => {};
+    apiMocks.fetchJSON.mockReturnValueOnce(new Promise((resolve) => { resolveSpeech = resolve; }));
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    voiceState.onTranscript?.("voice prompt", true);
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    voiceState.onGestureStart?.(true);
+    resolveSpeech({ data_url: "data:audio/wav;base64,AA==" });
+    await Promise.resolve();
+
+    expect(audioState.instances).toHaveLength(0);
+  });
+
+  it("defers pending speech until push-to-talk ends", async () => {
+    let resolveSpeech: (response: { data_url: string }) => void = () => {};
+    apiMocks.fetchJSON.mockReturnValueOnce(new Promise((resolve) => { resolveSpeech = resolve; }));
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+
+    voiceState.onTranscript?.("voice prompt", true);
+    sidebarState.current.onMessageStart?.({ voice_turn: true });
+    sidebarState.current.onMessageComplete?.({ text: "voice reply", voice_turn: true });
+    voiceState.onGestureStart?.(false);
+    resolveSpeech({ data_url: "data:audio/wav;base64,AA==" });
+    await Promise.resolve();
+
+    expect(audioState.instances).toHaveLength(1);
+    expect(audioState.instances[0].play).not.toHaveBeenCalled();
+    voiceState.onGestureEnd?.();
+    expect(audioState.instances[0].play).toHaveBeenCalledOnce();
   });
 
   it("keeps a manual transcript editable until its later Enter submits the marker", async () => {
