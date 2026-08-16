@@ -93,9 +93,9 @@ afterEach(async () => {
 });
 
 function button() { return container.querySelector("button") as HTMLButtonElement; }
-async function render(onTranscript = vi.fn()) {
+async function render(onTranscript = vi.fn(), onGestureStart = vi.fn()) {
   root = createRoot(container);
-  await act(async () => root.render(<PushToTalkButton onTranscript={onTranscript} />));
+  await act(async () => root.render(<PushToTalkButton onGestureStart={onGestureStart} onTranscript={onTranscript} />));
   return onTranscript;
 }
 
@@ -105,6 +105,18 @@ async function startRecording(expected = 1) {
 }
 
 describe("PushToTalkButton", () => {
+  it("marks a second quick press as a speech-cancel gesture", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(100).mockReturnValueOnce(200);
+    const onGestureStart = vi.fn();
+    await render(vi.fn(), onGestureStart);
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 1 })));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 1 })));
+    await act(async () => button().dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 2 })));
+    expect(onGestureStart).toHaveBeenNthCalledWith(1, false);
+    expect(onGestureStart).toHaveBeenNthCalledWith(2, true);
+    now.mockRestore();
+  });
+
   it("renders exactly two capture buttons: Send (PgUp) and Send + Save (PgDown)", async () => {
     await render();
     const buttons = Array.from(container.querySelectorAll("button"));
