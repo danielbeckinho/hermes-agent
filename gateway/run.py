@@ -4985,7 +4985,9 @@ class TurnRunner:
         # explaining that no response arrived (so the agent can adapt
         # rather than hang forever).
         # ------------------------------------------------------------------
-        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+        def _clarify_callback_sync(
+            question: str, choices, multi_select: bool = False, context: str = "",
+        ) -> str:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
@@ -5009,6 +5011,44 @@ class TurnRunner:
                 ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
             except Exception:
                 pass
+
+            brief = str(context or "").strip()
+            if brief:
+                # A decision brief is a prerequisite, not a best-effort
+                # companion: buttons are selection-only and must not appear
+                # without the context/comparison they refer to.
+                fut = safe_schedule_threadsafe(
+                    ctx._status_adapter.send(
+                        ctx._status_chat_id, brief, metadata=ctx._status_thread_metadata,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Clarify context send failed to schedule",
+                )
+                try:
+                    context_sent = bool(getattr(fut.result(timeout=15), "success", False)) if fut else False
+                except Exception as exc:
+                    logger.warning("Clarify context send failed: %s", exc)
+                    context_sent = False
+                if not context_sent:
+                    return "[clarify context could not be delivered]"
+
+                # Discord's adapter already owns bound-VC TTS and failure
+                # handling. Feature-detect it so all other adapters stay
+                # unchanged.
+                speak = getattr(ctx._status_adapter, "_speak_bound_clarify", None)
+                if callable(speak):
+                    try:
+                        speech = safe_schedule_threadsafe(
+                            speak(ctx._status_chat_id, brief),
+                            ctx._loop_for_step,
+                            logger=logger,
+                            log_message="Clarify context VC cue failed to schedule",
+                        )
+                        if speech:
+                            speech.result(timeout=15)
+                    except Exception:
+                        logger.debug("Clarify context VC cue failed", exc_info=True)
 
             # Ordering barrier (#clarify-ordering): flush any buffered
             # assistant prose (interim commentary / streamed deltas) to the

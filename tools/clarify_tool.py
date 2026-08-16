@@ -56,31 +56,25 @@ def _flatten_choice(c) -> str:
     return str(c).strip()
 
 
-def _invoke_callback(callback, question, choices, multi_select):
-    """Invoke the platform callback, passing multi_select if supported.
-
-    Uses signature inspection (not a ``TypeError`` retry) to decide whether
-    the callback accepts the ``multi_select`` keyword — a retry-on-TypeError
-    approach would re-invoke a *compatible* callback that raised TypeError
-    internally, potentially prompting the user twice.
-    """
+def _invoke_callback(callback, question, choices, multi_select, context=""):
+    """Invoke the callback without breaking legacy two-argument callbacks."""
     import inspect
 
-    accepts_multi = False
+    accepts_multi = accepts_context = False
     try:
-        sig = inspect.signature(callback)
-        params = sig.parameters
-        accepts_multi = "multi_select" in params or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
+        params = inspect.signature(callback).parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        accepts_multi = "multi_select" in params or has_var_kw
+        accepts_context = "context" in params or has_var_kw
     except (TypeError, ValueError):
-        # Builtins / C callables without introspectable signatures:
-        # be conservative and use the legacy 2-arg form.
-        accepts_multi = False
+        pass
 
+    kwargs = {}
     if accepts_multi:
-        return callback(question, choices, multi_select=multi_select)
-    return callback(question, choices)
+        kwargs["multi_select"] = multi_select
+    if accepts_context:
+        kwargs["context"] = context
+    return callback(question, choices, **kwargs)
 
 
 def _parse_multi_select_response(raw_response) -> List[str]:
@@ -113,6 +107,7 @@ def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
+    context: str = "",
     callback: Optional[Callable] = None,
 ) -> str:
     """
@@ -160,7 +155,7 @@ def clarify_tool(
         return tool_error("Clarify tool is not available in this execution context.")
 
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        raw_response = _invoke_callback(callback, question, choices, multi_select, context)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 
@@ -243,6 +238,10 @@ CLARIFY_SCHEMA = {
                     "Has no effect when choices is omitted (open-ended question)."
                 ),
             },
+            "context": {
+                "type": "string",
+                "description": "Optional decision brief shown before choices; keep options exclusively in `choices`.",
+            },
         },
         "required": ["question"],
     },
@@ -260,6 +259,7 @@ registry.register(
         question=args.get("question", ""),
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
+        context=args.get("context", ""),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",

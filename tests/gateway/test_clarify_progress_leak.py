@@ -11,6 +11,7 @@ the rendered interactive prompt on Slack.
 """
 
 import importlib
+import json
 import sys
 import time
 import types
@@ -74,6 +75,67 @@ class ClarifyThenToolAgent:
             cb("tool.started", "terminal", "pwd", {})
             time.sleep(0.35)
         return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class ContextClarifyAgent:
+    """Calls clarify with a decision brief through the real gateway callback."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self.clarify_callback = None
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        from tools.clarify_tool import clarify_tool
+
+        result = clarify_tool(
+            "Choose A or B?",
+            choices=["A", "B"],
+            context="Why this is needed; A is reversible; B is deferred. Recommend A.",
+            callback=self.clarify_callback,
+        )
+        return {"final_response": result, "messages": [], "api_calls": 1}
+
+
+class ContextClarifyAdapter(ProgressCaptureAdapter):
+    """Captures the brief → speech → native-prompt ordering."""
+
+    async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+        from tools.clarify_gateway import resolve_gateway_clarify
+
+        self.sent.append({"kind": "clarify", "question": question, "choices": choices})
+        resolve_gateway_clarify(clarify_id, "A (Recommended)")
+        return SendResult(success=True, message_id="m-2")
+
+    async def _speak_bound_clarify(self, chat_id, text):
+        self.sent.append({"kind": "speech", "content": text})
+
+
+class ClarifyContextAgent:
+    """Invokes the gateway's clarify_callback directly with a context brief."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        response = self.clarify_callback(
+            "Which environment?",
+            ["staging", "production"],
+            context="Staging is safe to break; production is not. Recommend staging.",
+        )
+        return {"final_response": response, "messages": [], "api_calls": 1}
+
+
+class ClarifyContextDeliveryFailsAdapter(ProgressCaptureAdapter):
+    """Context send always fails — clarify must never be registered."""
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append({"chat_id": chat_id, "content": content})
+        return SendResult(success=False, error="boom")
+
+    async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+        self.sent.append({"kind": "clarify", "chat_id": chat_id, "question": question, "choices": choices})
+        return SendResult(success=True, message_id="m-2")
 
 
 def _make_runner(adapter):
@@ -154,3 +216,68 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     assert "Asking" not in all_content
     # The unrelated terminal tool still renders progress normally.
     assert "pwd" in all_content
+
+
+@pytest.mark.asyncio
+async def test_clarify_context_is_sent_and_spoken_before_native_prompt(monkeypatch, tmp_path):
+    """A decision brief must precede its native selection on Discord."""
+    adapter = ContextClarifyAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, "off")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    fake_run_agent = sys.modules["run_agent"]
+    fake_run_agent.AIAgent = ContextClarifyAgent
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1", chat_type="group")
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-clarify-context",
+        session_key="agent:main:discord:group:C1",
+    )
+
+    assert json.loads(result["final_response"])["user_response"] == "A"
+    assert adapter.sent == [
+        {
+            "chat_id": "C1",
+            "content": "Why this is needed; A is reversible; B is deferred. Recommend A.",
+        },
+        {
+            "kind": "speech",
+            "content": "Why this is needed; A is reversible; B is deferred. Recommend A.",
+        },
+        {
+            "kind": "clarify",
+            "question": "Choose A or B?",
+            "choices": ["A (Recommended)", "B"],
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clarify_context_delivery_failure_skips_native_prompt(monkeypatch, tmp_path):
+    """A failed decision brief must not create a selectable orphan prompt."""
+    adapter = ClarifyContextDeliveryFailsAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, "off")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    sys.modules["run_agent"].AIAgent = ClarifyContextAgent
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1", chat_type="group")
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-clarify-context-failure",
+        session_key="agent:main:discord:group:C1",
+    )
+
+    assert result["final_response"] == "[clarify context could not be delivered]"
+    assert adapter.sent == [{
+        "chat_id": "C1",
+        "content": "Staging is safe to break; production is not. Recommend staging.",
+    }]
