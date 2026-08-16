@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,40 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+async def _best_effort_discord_voice_notice(adapter, chat_id: str, text: str) -> None:
+    """Speak one short notice without affecting the text notification path."""
+    audio_path = None
+    actual_path = None
+    try:
+        if not getattr(adapter, "is_voice_bound_to_chat")(chat_id):
+            return
+        from gateway.config import Platform
+        from gateway.platforms.base import build_auto_tts_output_path
+        from tools.tts_text_normalize import prepare_spoken_text
+        from tools.tts_tool import text_to_speech_tool
+
+        spoken = prepare_spoken_text(text, max_chars=None)
+        if not spoken or len(spoken) > 240:
+            return
+        audio_path = build_auto_tts_output_path(Platform.DISCORD)
+        result = json.loads(await asyncio.to_thread(
+            text_to_speech_tool, text=spoken, output_path=audio_path,
+        ))
+        actual_path = result.get("file_path", audio_path)
+        if not result.get("success") or not os.path.isfile(actual_path):
+            return
+        await adapter.play_tts(chat_id, actual_path)
+    except Exception as exc:
+        logger.debug("kanban notifier: Discord voice notice failed: %s", exc)
+    finally:
+        for path in {audio_path, actual_path}:
+            if path and os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 def _resolve_auto_decompose_settings(
@@ -704,6 +739,15 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            if (
+                                platform_str == "discord"
+                                and isinstance(delivery_metadata, dict)
+                                and delivery_metadata.get("discord_voice_notice") is True
+                                and getattr(adapter, "is_voice_bound_to_chat", None)
+                            ):
+                                await _best_effort_discord_voice_notice(
+                                    adapter, sub["chat_id"], msg,
+                                )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:

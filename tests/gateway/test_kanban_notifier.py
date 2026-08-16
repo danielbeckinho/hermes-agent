@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 
 from gateway.config import Platform
@@ -22,6 +23,54 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+
+
+def test_best_effort_discord_voice_notice_synthesizes_plays_and_cleans(monkeypatch, tmp_path):
+    from gateway.kanban_watchers import _best_effort_discord_voice_notice
+    audio = tmp_path / "notice.mp3"
+    spoken = []
+    played = []
+
+    def fake_tts(**kwargs):
+        spoken.append(kwargs["text"])
+        audio.write_bytes(b"audio")
+        return '{"success": true, "file_path": "%s"}' % audio
+
+    adapter = MagicMock()
+    adapter.is_voice_bound_to_chat.return_value = True
+    adapter.play_tts = AsyncMock(side_effect=lambda chat_id, path: played.append((chat_id, path)))
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    monkeypatch.setattr("gateway.platforms.base.build_auto_tts_output_path", lambda _platform: str(audio))
+
+    asyncio.run(_best_effort_discord_voice_notice(adapter, "chat-1", "**Done**: task finished"))
+    assert spoken == ["Done: task finished"]
+    assert played == [("chat-1", str(audio))]
+    assert not audio.exists()
+
+
+def test_best_effort_discord_voice_notice_skips_unbound_or_long(monkeypatch):
+    from gateway.kanban_watchers import _best_effort_discord_voice_notice
+    adapter = MagicMock()
+    adapter.is_voice_bound_to_chat.return_value = False
+    tts = MagicMock()
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", tts)
+
+    asyncio.run(_best_effort_discord_voice_notice(adapter, "chat-1", "short"))
+    assert not tts.called
+    adapter.is_voice_bound_to_chat.return_value = True
+    asyncio.run(_best_effort_discord_voice_notice(adapter, "chat-1", "x" * 300))
+    assert not tts.called
+
+
+def test_best_effort_discord_voice_notice_swallows_tts_and_playback_errors(monkeypatch):
+    from gateway.kanban_watchers import _best_effort_discord_voice_notice
+    adapter = MagicMock()
+    adapter.is_voice_bound_to_chat.return_value = True
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", lambda **_: (_ for _ in ()).throw(RuntimeError("tts")))
+    asyncio.run(_best_effort_discord_voice_notice(adapter, "chat-1", "short"))
+    adapter.play_tts.assert_not_called()
 
 
 class DisconnectedAdapters(dict):

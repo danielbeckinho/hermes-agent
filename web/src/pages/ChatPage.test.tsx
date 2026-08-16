@@ -281,7 +281,8 @@ describe("ChatPage", () => {
 
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
 
-    expect(container.querySelector('[aria-label="Hold to talk"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Send (PgUp)"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Send + Save (PgDown)"]')).not.toBeNull();
   });
 });
 

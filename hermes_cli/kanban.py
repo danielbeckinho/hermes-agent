@@ -815,6 +815,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("--platform", required=True)
     p_nsub.add_argument("--chat-id", required=True)
     p_nsub.add_argument("--thread-id", default=None)
+    p_nsub.add_argument("--voice", action="store_true", help="Also speak Discord lifecycle notices while the bot is VC-bound to this chat")
     p_nsub.add_argument("--user-id", default=None)
     p_nsub.add_argument("--user-id-alt", default=None)
     p_nsub.add_argument(
@@ -2934,6 +2935,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    if args.voice and args.platform.lower() != "discord":
+        print("--voice is only supported with --platform discord", file=sys.stderr)
+        return 2
+    delivery_metadata = {"discord_voice_notice": True} if args.voice else None
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
@@ -2946,6 +2951,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             user_id_alt=getattr(args, "user_id_alt", None),
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
+            delivery_metadata=delivery_metadata,
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")

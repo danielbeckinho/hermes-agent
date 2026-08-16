@@ -32,7 +32,11 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
-import { PushToTalkButton } from "@/components/PushToTalkButton";
+import {
+  PushToTalkButton,
+  readTranscriptAutosaveSettings,
+  type TranscriptAutosaveSettings,
+} from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api, fetchJSON } from "@/lib/api";
@@ -489,16 +493,33 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // submissionCore.ts VOICE_TURN_MARKER and tui_gateway/server.py
   // _run_prompt_submit). That round-trip is how handleVoiceCompletion below
   // knows the finished turn's reply should be spoken.
-  const handleVoiceTranscript = useCallback((transcript: string) => {
+  const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
+    if (!settings.timestamp || !settings.path.trim() || !text.trim()) return;
+    const savedText = text.split(/\r?\n/).filter((line) => line.trim()).map((line) => `${new Date().toISOString()} ${line}`).join("\n");
+    void fetchJSON("/api/dashboard/transcript-autosave", {
+      body: JSON.stringify({ path: settings.path, text: savedText }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }).catch(() => {});
+  }, []);
+
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend = true, autosave: TranscriptAutosaveSettings = readTranscriptAutosaveSettings()) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!autoSend) {
+      pendingVoiceTurnRef.current = "idle";
+      ptyInputLineRef.current = transcript;
+      ws.send(transcript);
+      return;
+    }
     pendingVoiceTurnRef.current = "awaiting-start";
     ws.send(`${transcript}`);
     setTimeout(() => {
       const current = wsRef.current;
       if (current && current.readyState === WebSocket.OPEN) current.send("\r");
     }, 100);
-  }, []);
+    savePrompt(transcript, autosave);
+  }, [savePrompt]);
 
   const handleVoiceStart = useCallback((payload: unknown) => {
     if (
