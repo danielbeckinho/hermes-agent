@@ -659,78 +659,30 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
-    """True if the Host header targets the interface we bound to.
+def _host_without_port(host: str) -> str:
+    host = host.strip()
+    if host.startswith("["):
+        close = host.find("]")
+        return host[1:close] if close != -1 else host.strip("[]")
+    return host.rsplit(":", 1)[0] if ":" in host else host
 
-    Accepts:
-    - Exact bound host (with or without port suffix)
-    - Loopback aliases when bound to loopback
-    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
-      no protection possible at this layer)
-    """
+
+def _is_accepted_host(
+    host_header: str, bound_host: str, allowed_hosts: frozenset[str] = frozenset()
+) -> bool:
+    """True if the Host header targets the interface we bound to."""
     if not host_header:
         return False
-    # Strip port suffix. IPv6 addresses use bracket notation:
-    #   [::1]         — no port
-    #   [::1]:9119    — with port
-    # Plain hosts/v4:
-    #   localhost:9119
-    #   127.0.0.1:9119
-    h = host_header.strip()
-    if h.startswith("["):
-        # IPv6 bracketed — port (if any) follows "]:"
-        close = h.find("]")
-        if close != -1:
-            host_only = h[1:close]  # strip brackets
-        else:
-            host_only = h.strip("[]")
-    else:
-        host_only = h.rsplit(":", 1)[0] if ":" in h else h
-    host_only = host_only.lower()
+    host_only = _host_without_port(host_header).lower()
 
-    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
-    # (requires --insecure per web_server.start_server). No Host-layer
-    # defence can protect that mode; rely on operator network controls.
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
-    # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
         return host_only in _LOOPBACK_HOST_VALUES
 
-    # Explicit non-loopback bind: require exact host match
-    return host_only == bound_lc
-
-
-@app.middleware("http")
-async def host_header_middleware(request: Request, call_next):
-    """Reject requests whose Host header doesn't match the bound interface.
-
-    Defends against DNS rebinding: a victim browser on a localhost
-    dashboard is tricked into fetching from an attacker hostname that
-    TTL-flips to 127.0.0.1. CORS and same-origin checks don't help —
-    the browser now treats the attacker origin as same-origin with the
-    dashboard. Host-header validation at the app layer catches it.
-
-    See GHSA-ppp5-vxwm-4cf7.
-    """
-    # Store the bound host on app.state so this middleware can read it —
-    # set by start_server() at listen time.
-    bound_host = getattr(app.state, "bound_host", None)
-    if bound_host:
-        host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "detail": (
-                        "Invalid Host header. Dashboard requests must use "
-                        "the hostname the server was bound to."
-                    ),
-                },
-            )
-    return await call_next(request)
+    return host_only == bound_lc or host_only in allowed_hosts
 
 
 @app.middleware("http")
@@ -933,6 +885,27 @@ async def _dashboard_health_middleware(request: Request, call_next):
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
     return response
+
+
+@app.middleware("http")
+async def host_header_middleware(request: Request, call_next):
+    """Reject forged Host headers before any auth middleware can redirect."""
+    bound_host = getattr(app.state, "bound_host", None)
+    if bound_host:
+        host_header = request.headers.get("host", "")
+        if not _is_accepted_host(
+            host_header, bound_host, getattr(app.state, "allowed_hosts", frozenset()) or frozenset()
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        "Invalid Host header. Dashboard requests must use "
+                        "the hostname the server was bound to."
+                    ),
+                },
+            )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -15428,7 +15401,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    allowed_hosts = getattr(app.state, "allowed_hosts", frozenset()) or frozenset()
+    if not _is_accepted_host(host_header, bound_host, allowed_hosts):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -15445,7 +15419,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _is_accepted_host(parsed.netloc, bound_host, allowed_hosts):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -18371,6 +18345,7 @@ def start_server(
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
+    allowed_hosts: Optional[List[str]] = None,
     initial_profile: str = "",
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
@@ -18514,6 +18489,11 @@ def start_server(
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
     app.state.bound_host = host
+    app.state.allowed_hosts = frozenset(
+        normalized
+        for allowed_host in allowed_hosts or []
+        if (normalized := _host_without_port(allowed_host).lower())
+    )
 
     # ── Start uvicorn with direct Server API ─────────────────────────
     # We use uvicorn.Server directly (not uvicorn.run) so we can split
