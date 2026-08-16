@@ -92,7 +92,10 @@ vi.mock("@/components/PushToTalkButton", () => ({
     voiceState.onTranscript = props.onTranscript;
     return null;
   },
-  readTranscriptAutosaveSettings: () => ({ enabled: false, path: "transcript.txt" }),
+  readTranscriptAutosaveSettings: () => ({
+    enabled: window.localStorage.getItem("hermes.transcriptAutosave.enabled") === "1",
+    path: window.localStorage.getItem("hermes.transcriptAutosave.path") || "transcript.txt",
+  }),
 }));
 vi.mock("@/components/ChatSessionList", () => ({
   ChatSessionList: () => null,
@@ -235,6 +238,13 @@ beforeEach(() => {
     },
   });
   sessionStorage.clear();
+  const localStorageStore = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    clear: () => localStorageStore.clear(),
+    getItem: (key: string) => (localStorageStore.has(key) ? localStorageStore.get(key)! : null),
+    removeItem: (key: string) => localStorageStore.delete(key),
+    setItem: (key: string, value: string) => localStorageStore.set(key, value),
+  });
 });
 
 afterEach(async () => {
@@ -298,6 +308,36 @@ describe("ChatPage", () => {
     // NOT append to the transcript file — only an explicit Send + Save does.
     voiceState.onTranscript?.("voice prompt", true, { enabled: true, path: "transcript.txt" });
 
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+  });
+
+  it("does not save typed text or a manual voice transcript submitted via Enter", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(voiceState.onTranscript).toBeTypeOf("function"));
+    const terminal = FakeTerminal.instances.at(-1)!;
+    await vi.waitFor(() => expect(terminal.onDataHandler).toBeTypeOf("function"));
+    const ws = FakeWebSocket.instances.at(-1)!;
+    await act(async () => ws.onopen?.());
+
+    // Checkbox on (persisted). Typed text followed by Enter routes through
+    // the onData submit seam and must never append to the transcript file —
+    // only Send + Save does.
+    window.localStorage.setItem("hermes.transcriptAutosave.enabled", "1");
+    await act(async () => terminal.onDataHandler?.("typed text"));
+    await act(async () => terminal.onDataHandler?.("\r"));
+    expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
+      "/api/dashboard/transcript-autosave",
+      expect.anything(),
+    );
+
+    // A manually-edited voice transcript submitted later via Enter is also
+    // not a Send + Save, so likewise must not be written.
+    voiceState.onTranscript?.("editable voice", false);
+    await act(async () => terminal.onDataHandler?.("\r"));
     expect(apiMocks.fetchJSON).not.toHaveBeenCalledWith(
       "/api/dashboard/transcript-autosave",
       expect.anything(),
