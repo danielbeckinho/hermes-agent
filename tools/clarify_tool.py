@@ -77,6 +77,18 @@ def _invoke_callback(callback, question, choices, multi_select, context=""):
     return callback(question, choices, **kwargs)
 
 
+def _strip_recommended(text: str) -> str:
+    suffix = " (Recommended)"
+    text = str(text).strip()
+    return text[:-len(suffix)].rstrip() if text.casefold().endswith(suffix.casefold()) else text
+
+
+def _mark_recommended(choices: List[str]) -> List[str]:
+    if len(choices) < 2 or _strip_recommended(choices[0]) != choices[0].strip():
+        return choices
+    return [f"{choices[0].strip()} (Recommended)", *choices[1:]]
+
+
 def _parse_multi_select_response(raw_response) -> List[str]:
     """Parse a multi-select response into a list of cleaned choice strings.
 
@@ -150,6 +162,8 @@ def clarify_tool(
             choices = choices[:MAX_CHOICES]
         if not choices:
             choices = None  # empty list → open-ended
+        elif context:
+            choices = _mark_recommended(choices)
 
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
@@ -160,9 +174,9 @@ def clarify_tool(
         return tool_error(f"Failed to get user input: {exc}")
 
     if multi_select and choices is not None:
-        user_response = _parse_multi_select_response(raw_response)
+        user_response = [_strip_recommended(response) for response in _parse_multi_select_response(raw_response)]
     else:
-        user_response = str(raw_response).strip()
+        user_response = _strip_recommended(raw_response)
 
     return json.dumps({
         "question": question,
