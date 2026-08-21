@@ -21,6 +21,22 @@ const AUTO_SEND_KEY = "hermes.voice.autoSend";
 const DOUBLE_TAP_CANCEL_MS = 300;
 export const TRANSCRIPT_AUTOSAVE_ENABLED_KEY = "hermes.transcriptAutosave.enabled";
 export const TRANSCRIPT_AUTOSAVE_PATH_KEY = "hermes.transcriptAutosave.path";
+
+export function voiceShortcutForKey(key: string): "save" | "send" | null {
+  if (key === "PageUp") return "send";
+  if (key === "PageDown") return "save";
+  return null;
+}
+
+export function shouldHandleGlobalVoiceShortcut(key: string, targetIsPttControl: boolean, autosaveEnabled: boolean): boolean {
+  const shortcut = voiceShortcutForKey(key);
+  return shortcut !== null && !targetIsPttControl && (shortcut !== "save" || autosaveEnabled);
+}
+
+export function encodeVoiceSubmission(transcript: string, autoSend: boolean): { submit: string; text: string } {
+  return { text: `${transcript}${autoSend ? "\uE000" : ""}`, submit: autoSend ? "\r" : "" };
+}
+
 function readAutoSend(): boolean {
   try {
     const v = window.localStorage.getItem(AUTO_SEND_KEY);
@@ -186,7 +202,9 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
       && Boolean(target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])"));
     const onKeyDown = (event: KeyboardEvent) => {
       if (isEditable(event.target)) return;
-      if (event.key === "PageUp") {
+      const targetIsPttControl = event.target instanceof Element && Boolean(event.target.closest("[data-ptt-key]"));
+      if (!shouldHandleGlobalVoiceShortcut(event.key, targetIsPttControl, autosave.enabled)) return;
+      if (voiceShortcutForKey(event.key) === "send") {
         if (pageUpHeldRef.current) {
           event.preventDefault();
           return;
@@ -194,14 +212,14 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
         pageUpHeldRef.current = true;
         event.preventDefault();
         void start();
-      } else if (event.key === "PageDown" && autosave.enabled) {
+      } else {
         if (pageDownHeldRef.current) {
           event.preventDefault();
           return;
         }
         pageDownHeldRef.current = true;
         event.preventDefault();
-        void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
+        void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
       }
     };
     const onKeyUp = (event: KeyboardEvent) => {
@@ -240,6 +258,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
     <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5 sm:bottom-3 sm:left-3">
       <Button
         type="button"
+        data-ptt-key="PageUp"
         aria-label={
           state === "requesting" ? "Requesting microphone"
           : state === "recording" ? "Recording. Release to send"
@@ -275,13 +294,14 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
       </Button>
       <Button
         type="button"
+        data-ptt-key="PageDown"
         aria-label="Send + Save (PgDown)"
         disabled={!autosave.enabled}
         className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-40"
         onKeyDown={(event) => {
           if (event.key === "PageDown" && autosave.enabled) {
             event.preventDefault();
-            void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
+            void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
           }
         }}
         onKeyUp={(event) => {
@@ -295,7 +315,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
           if (!autosave.enabled) return;
           event.preventDefault();
           event.currentTarget.setPointerCapture(event.pointerId);
-          void start({ autosave: { ...autosave, enabled: true, timestamp: true } });
+          void start({ autoSend: true, autosave: { ...autosave, enabled: true, timestamp: true } });
         }}
         onLostPointerCapture={release}
         onPointerUp={release}

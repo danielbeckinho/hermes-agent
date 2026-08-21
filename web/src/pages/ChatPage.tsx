@@ -34,7 +34,7 @@ import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
 import {
   PushToTalkButton,
-  type TranscriptAutosaveSettings,
+  encodeVoiceSubmission,
 } from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
@@ -379,16 +379,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     [titleScope],
   );
 
-  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean, _autosave: TranscriptAutosaveSettings) => {
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     manualVoiceDraftPendingRef.current = !autoSend;
     pendingVoiceTurnRef.current = autoSend ? "awaiting-start" : "idle";
-    ws.send(`${transcript}${autoSend ? "\\uE000" : ""}`);
-    if (autoSend) {
+    const submission = encodeVoiceSubmission(transcript, autoSend);
+    ws.send(submission.text);
+    if (submission.submit) {
       setTimeout(() => {
         const current = wsRef.current;
-        if (current && current.readyState === WebSocket.OPEN) current.send("\\r");
+        if (current && current.readyState === WebSocket.OPEN) current.send(submission.submit);
       }, 100);
     }
   }, []);
@@ -1527,8 +1528,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = 0;
         }
         let output = normalized.data;
-        if (manualVoiceDraftPendingRef.current && output.includes("\\r")) {
-          output = output.replace("\\r", "\\uE000\\r");
+        if (manualVoiceDraftPendingRef.current && output.includes("\r")) {
+          output = output.replace("\r", "\uE000\r");
           manualVoiceDraftPendingRef.current = false;
           pendingVoiceTurnRef.current = "awaiting-start";
         }
