@@ -30,6 +30,14 @@ def _add_server_runtime_args(parser) -> None:
         "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
     )
     parser.add_argument(
+        "--allowed-host",
+        dest="allowed_hosts",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Exact additional Host header accepted behind a reverse proxy (repeatable)",
+    )
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help=(

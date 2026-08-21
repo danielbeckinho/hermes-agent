@@ -47,6 +47,16 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_explicit_allowed_alias_matches_non_loopback_bind(self):
+        """A Tailscale Serve hostname may be explicitly allowed while the
+        process remains bound to the numeric Tailscale interface."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        allowed = ("node-01.tail6ba6bf.ts.net",)
+        assert _is_accepted_host("node-01.tail6ba6bf.ts.net", "100.81.246.101", allowed)
+        assert _is_accepted_host("node-01.tail6ba6bf.ts.net:443", "100.81.246.101", allowed)
+        assert not _is_accepted_host("evil.example", "100.81.246.101", allowed)
+
 
 
 class TestHostHeaderMiddleware:
