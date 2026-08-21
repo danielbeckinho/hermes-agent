@@ -708,7 +708,6 @@ def _is_accepted_host(
     return host_only == bound_lc
 
 
-@app.middleware("http")
 async def host_header_middleware(request: Request, call_next):
     """Reject requests whose Host header doesn't match the bound interface.
 
@@ -857,6 +856,10 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+# Register last so Starlette executes the Host guard before auth redirects.
+app.middleware("http")(host_header_middleware)
 
 
 # ---------------------------------------------------------------------------

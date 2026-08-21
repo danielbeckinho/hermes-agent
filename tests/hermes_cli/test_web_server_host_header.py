@@ -84,6 +84,30 @@ class TestHostHeaderMiddleware:
             if hasattr(app.state, "bound_host"):
                 del app.state.bound_host
 
+    def test_non_loopback_host_guard_precedes_auth_redirect(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from starlette.responses import RedirectResponse
+        from hermes_cli.web_server import app
+
+        async def fake_auth_gate(request, call_next):
+            return RedirectResponse("/login")
+
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.middleware.gated_auth_middleware",
+            fake_auth_gate,
+        )
+        app.state.bound_host = "100.81.246.101"
+        app.state.auth_required = True
+        try:
+            response = TestClient(app).get(
+                "/", headers={"Host": "evil.example"}, follow_redirects=False
+            )
+            assert response.status_code == 400
+            assert "Invalid Host header" in response.json()["detail"]
+        finally:
+            for name in ("bound_host", "auth_required"):
+                if hasattr(app.state, name):
+                    delattr(app.state, name)
 
     def test_no_bound_host_skips_validation(self):
         """If app.state.bound_host isn't set (e.g. running under test
