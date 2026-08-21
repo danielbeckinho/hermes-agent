@@ -32,9 +32,13 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import {
+  PushToTalkButton,
+  encodeVoiceSubmission,
+} from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, fetchJSON } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { normalizeSessionTitle } from "@/lib/chat-title";
@@ -179,6 +183,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const speechRef = useRef<HTMLAudioElement | null>(null);
+  const speechInterruptedRef = useRef(false);
+  const speechGenerationRef = useRef(0);
+  const pendingVoiceTurnRef = useRef<"idle" | "awaiting-start" | "active">("idle");
+  const manualVoiceDraftPendingRef = useRef(false);
   const stickToBottomRef = useRef(true);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
@@ -217,6 +226,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : null,
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [ttsPlaybackBlockedUrl, setTtsPlaybackBlockedUrl] = useState<string | null>(null);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -368,6 +378,89 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
     [titleScope],
   );
+
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    manualVoiceDraftPendingRef.current = !autoSend;
+    pendingVoiceTurnRef.current = autoSend ? "awaiting-start" : "idle";
+    const submission = encodeVoiceSubmission(transcript, autoSend);
+    ws.send(submission.text);
+    if (submission.submit) {
+      setTimeout(() => {
+        const current = wsRef.current;
+        if (current && current.readyState === WebSocket.OPEN) current.send(submission.submit);
+      }, 100);
+    }
+  }, []);
+
+  const handleVoiceStart = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current === "awaiting-start"
+      && typeof payload === "object"
+      && payload !== null
+      && (payload as { voice_turn?: unknown }).voice_turn === true
+    ) {
+      pendingVoiceTurnRef.current = "active";
+    }
+  }, []);
+
+  const interruptSpeech = useCallback((cancel: boolean) => {
+    if (cancel) {
+      speechGenerationRef.current += 1;
+      speechInterruptedRef.current = false;
+      const speech = speechRef.current;
+      speech?.pause();
+      if (speech) speech.currentTime = 0;
+      speechRef.current = null;
+      setTtsPlaybackBlockedUrl(null);
+      return;
+    }
+    speechInterruptedRef.current = true;
+    speechRef.current?.pause();
+  }, []);
+
+  const resumeSpeech = useCallback(() => {
+    speechInterruptedRef.current = false;
+    const speech = speechRef.current;
+    if (speech) void speech.play().catch(() => setTtsPlaybackBlockedUrl(speech.src));
+  }, []);
+
+  const handleVoiceCompletion = useCallback((payload: unknown) => {
+    if (
+      pendingVoiceTurnRef.current !== "active"
+      || typeof payload !== "object"
+      || payload === null
+      || (payload as { voice_turn?: unknown }).voice_turn !== true
+    ) return;
+    pendingVoiceTurnRef.current = "idle";
+    const text = String((payload as { text?: unknown }).text ?? "").trim();
+    if (!text) return;
+    const speechGeneration = speechGenerationRef.current;
+    void fetchJSON<{ data_url?: string }>(
+      `/api/audio/speak${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`,
+      {
+        body: JSON.stringify({ text }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ).then((response) => {
+      if (!response.data_url || speechGeneration !== speechGenerationRef.current) return;
+      const priorSpeech = speechRef.current;
+      priorSpeech?.pause();
+      if (priorSpeech) priorSpeech.currentTime = 0;
+      const speech = priorSpeech ?? new Audio();
+      speech.src = response.data_url;
+      speech.onended = () => {
+        if (speechRef.current === speech) speechRef.current = null;
+      };
+      speechRef.current = speech;
+      setTtsPlaybackBlockedUrl(null);
+      if (!speechInterruptedRef.current) {
+        void speech.play().catch(() => setTtsPlaybackBlockedUrl(response.data_url ?? null));
+      }
+    }).catch(() => {});
+  }, [scopedProfile]);
 
   useEffect(() => {
     if (!isActive) {
@@ -1434,7 +1527,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0;
         }
-        ws.send(normalized.data);
+        let output = normalized.data;
+        if (manualVoiceDraftPendingRef.current && output.includes("\r")) {
+          output = output.replace("\r", "\uE000\r");
+          manualVoiceDraftPendingRef.current = false;
+          pendingVoiceTurnRef.current = "awaiting-start";
+        }
+        ws.send(output);
       };
       // The deferred composition fallback is already committed text, so it
       // must not consume the mobile replacement window intended for xterm's
@@ -1754,6 +1853,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
@@ -1796,6 +1897,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+          <PushToTalkButton
+            onGestureEnd={resumeSpeech}
+            onGestureStart={interruptSpeech}
+            onTranscript={handleVoiceTranscript}
+            profile={scopedProfile}
+          />
+          {ttsPlaybackBlockedUrl && (
+            <Button
+              type="button"
+              onClick={() => {
+                const speech = speechRef.current;
+                if (!speech) return;
+                void speech.play().then(() => setTtsPlaybackBlockedUrl(null)).catch(() => undefined);
+              }}
+              aria-label="Play voice reply"
+              className="absolute bottom-2 left-2 z-20 rounded border border-warning/60 bg-black px-2 py-1 text-xs text-warning shadow-md sm:bottom-3 sm:left-3"
+            >
+              Voice reply — Play
+            </Button>
+          )}
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1926,6 +2047,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
+                onMessageStart={handleVoiceStart}
+                onMessageComplete={handleVoiceCompletion}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
