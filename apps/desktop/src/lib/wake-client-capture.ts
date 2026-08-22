@@ -7,6 +7,8 @@
  * runs server-side without requiring a server sound device.
  */
 
+import { openMicrophoneStream } from './mic-capture'
+
 const TARGET_RATE = 16_000
 const DEFAULT_FRAME = 1280 // 80 ms @ 16 kHz — matches tools/wake_word.py
 
@@ -95,15 +97,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     throw new Error('getUserMedia unavailable for client wake capture')
   }
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    },
-    video: false
-  })
+  const stream = await openMicrophoneStream()
 
   const context = new AudioContextCtor()
   const source = context.createMediaStreamSource(stream)
