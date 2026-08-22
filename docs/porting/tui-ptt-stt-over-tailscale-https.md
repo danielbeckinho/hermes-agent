@@ -189,7 +189,8 @@ Do not “fix” this with `0.0.0.0`, wildcard Host acceptance, or plain HTTP.
 
 ## 6. Use a guarded dashboard-only deployment
 
-The owner-run handoff script is `/home/hermesnubs/.hermes/release-handoff/deploy-ptt-hotfix.sh` and must:
+The owner-run handoff script is versioned at `scripts/deploy-ptt-hotfix.sh`; the
+owner-run copy used on this host is `/home/hermesnubs/.hermes/release-handoff/deploy-ptt-hotfix.sh` and must:
 
 1. Assert the target worktree is clean and the built marker exists.
 2. Validate the target parser accepts `--allowed-host` from the target CWD.
