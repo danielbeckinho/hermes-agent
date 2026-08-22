@@ -97,6 +97,12 @@ class AudioTranscriptionRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
+class TranscriptAutosaveAppend(BaseModel):
+    path: str
+    text: str
+    profile: Optional[str] = None
+
+
 class ManagedFileUpload(BaseModel):
     path: str
     data_url: str
