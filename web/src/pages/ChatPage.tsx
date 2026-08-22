@@ -35,6 +35,7 @@ import { ChatSessionList } from "@/components/ChatSessionList";
 import {
   PushToTalkButton,
   encodeVoiceSubmission,
+  type TranscriptAutosaveSettings,
 } from "@/components/PushToTalkButton";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
@@ -379,7 +380,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     [titleScope],
   );
 
-  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean) => {
+  const savePrompt = useCallback((text: string, settings: TranscriptAutosaveSettings) => {
+    if (!settings.enabled || !settings.path.trim() || !text.trim()) return;
+    const savedText = settings.timestamp
+      ? text
+        .split(/\r?\n/)
+        .filter((line) => line.trim())
+        .map((line) => `${new Date().toISOString()} ${line}`)
+        .join("\n")
+      : text;
+    void fetchJSON(`/api/dashboard/transcript-autosave${scopedProfile ? `?profile=${encodeURIComponent(scopedProfile)}` : ""}`, {
+      body: JSON.stringify({ path: settings.path, text: savedText }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    }).catch(() => {});
+  }, [scopedProfile]);
+
+  const handleVoiceTranscript = useCallback((transcript: string, autoSend: boolean, autosave: TranscriptAutosaveSettings) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     manualVoiceDraftPendingRef.current = !autoSend;
@@ -392,7 +409,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (current && current.readyState === WebSocket.OPEN) current.send(submission.submit);
       }, 100);
     }
-  }, []);
+    if (autosave.timestamp) savePrompt(transcript, autosave);
+  }, [savePrompt]);
 
   const handleVoiceStart = useCallback((payload: unknown) => {
     if (
