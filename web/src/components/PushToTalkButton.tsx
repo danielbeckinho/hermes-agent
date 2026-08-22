@@ -115,6 +115,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
   const gestureStartedAtRef = useRef(0);
   const lastTapAtRef = useRef(0);
   const [state, setState] = useState<"idle" | "requesting" | "recording" | "error">("idle");
+  const [activeShortcut, setActiveShortcut] = useState<"save" | "send" | null>(null);
   const [autoSend, setAutoSend] = useState(() => readAutoSend());
   const [autosave, setAutosave] = useState(() => readTranscriptAutosaveSettings());
   const autoSendRef = useRef(autoSend);
@@ -124,6 +125,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
 
   const release = useCallback(() => {
     holdingRef.current = false;
+    setActiveShortcut(null);
     const now = Date.now();
     lastTapAtRef.current = now - gestureStartedAtRef.current <= DOUBLE_TAP_CANCEL_MS ? now : 0;
     onGestureEnd?.();
@@ -139,6 +141,7 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
 
   const start = useCallback(async (options?: { autoSend?: boolean; autosave?: TranscriptAutosaveSettings }) => {
     if (requestingRef.current || recordingRef.current) return;
+    setActiveShortcut(options?.autosave?.timestamp ? "save" : "send");
     const now = Date.now();
     const cancel = lastTapAtRef.current > 0 && now - lastTapAtRef.current <= DOUBLE_TAP_CANCEL_MS;
     lastTapAtRef.current = 0;
@@ -260,14 +263,14 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
         type="button"
         data-ptt-key="PageUp"
         aria-label={
-          state === "requesting" ? "Requesting microphone"
-          : state === "recording" ? "Recording. Release to send"
-          : state === "error" ? "Microphone error. Press to retry"
+          activeShortcut === "send" && state === "requesting" ? "Requesting microphone"
+          : activeShortcut === "send" && state === "recording" ? "Recording. Release to send"
+          : activeShortcut === "send" && state === "error" ? "Microphone error. Press to retry"
           : "Send (PgUp)"
         }
-        aria-pressed={state === "recording"}
-        aria-busy={state === "requesting"}
-        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${state === "recording" ? "border-red-400 bg-red-950" : state === "requesting" ? "border-yellow-300 bg-yellow-950" : state === "error" ? "border-orange-400 bg-orange-950" : "border-white/70 bg-black"}`}
+        aria-pressed={activeShortcut === "send" && state === "recording"}
+        aria-busy={activeShortcut === "send" && state === "requesting"}
+        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${activeShortcut === "send" && state === "recording" ? "border-red-400 bg-red-950" : activeShortcut === "send" && state === "requesting" ? "border-yellow-300 bg-yellow-950" : activeShortcut === "send" && state === "error" ? "border-orange-400 bg-orange-950" : "border-white/70 bg-black"}`}
         onKeyDown={(event) => {
           if (event.key === "PageUp") {
             event.preventDefault();
@@ -290,14 +293,14 @@ export function PushToTalkButton({ onTranscript, onGestureStart, onGestureEnd, p
         onPointerUp={release}
       >
         <Mic className="size-3" />
-        <span className="ml-1">{state === "idle" ? "Send (PgUp)" : state === "error" ? "retry" : state}</span>
+        <span className="ml-1">{activeShortcut !== "send" || state === "idle" ? "Send (PgUp)" : state === "error" ? "retry" : state}</span>
       </Button>
       <Button
         type="button"
         data-ptt-key="PageDown"
-        aria-label="Send + Save (PgDown)"
+        aria-label={activeShortcut === "save" && state !== "idle" ? `${state}. Release to save` : "Send + Save (PgDown)"}
         disabled={!autosave.enabled}
-        className="rounded border border-white/70 bg-black px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-40"
+        className={`rounded border px-2 py-1 text-xs text-white shadow-md outline-none focus-visible:ring-2 focus-visible:ring-white ${activeShortcut === "save" && state === "recording" ? "border-red-400 bg-red-950" : activeShortcut === "save" && state === "requesting" ? "border-yellow-300 bg-yellow-950" : "border-white/70 bg-black disabled:cursor-not-allowed disabled:opacity-40"}`}
         onKeyDown={(event) => {
           if (event.key === "PageDown" && autosave.enabled) {
             event.preventDefault();
