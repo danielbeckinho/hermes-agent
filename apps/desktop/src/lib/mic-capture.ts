@@ -37,8 +37,16 @@ export async function openMicrophoneStream(
 ): Promise<MediaStream> {
   let lastError: unknown
 
+  const reportAttempt = (diagnostics: MicrophoneCaptureDiagnostics) => {
+    if (import.meta.env.DEV) {
+      console.debug('[mic-capture]', diagnostics)
+    }
+
+    options.onAttempt?.(diagnostics)
+  }
+
   try {
-    options.onAttempt?.({ attempt: 'default', inputCount: 0 })
+    reportAttempt({ attempt: 'default', inputCount: 0 })
 
     return await mediaDevices.getUserMedia(constraints())
   } catch (error) {
@@ -59,7 +67,7 @@ export async function openMicrophoneStream(
 
   for (const [index, deviceId] of deviceIds.entries()) {
     try {
-      options.onAttempt?.({ attempt: 'explicit', inputCount: inputs.length, explicitIndex: index })
+      reportAttempt({ attempt: 'explicit', inputCount: inputs.length, explicitIndex: index })
 
       return await mediaDevices.getUserMedia(constraints(deviceId))
     } catch (error) {
